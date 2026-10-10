@@ -1319,6 +1319,98 @@ static void bridge_NtCreateEvent(void)
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
+static HANDLE bridge_ke_object(uint32_t va);
+
+/* Serializes auto-shadow creation below; a plain ke_shadow_insert is
+ * last-wins, so two threads minting objects for one VA must not race. */
+static INIT_ONCE g_ke_obj_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_ke_obj_cs;
+
+static BOOL CALLBACK bridge_ke_object_cs_init(PINIT_ONCE o, PVOID p, PVOID *ctx)
+{
+    (void)o; (void)p; (void)ctx;
+    InitializeCriticalSection(&g_ke_obj_cs);
+    return TRUE;
+}
+
+/* Resolve a kernel-mode dispatcher object for the Ke* family.
+ *
+ * Xbox kernel code waits on the *object pointer* directly -- a KEVENT or
+ * KSEMAPHORE embedded in any guest structure -- while NtCreateEvent hands
+ * out handle tokens. A guest VA therefore resolves in this order:
+ *
+ *   1. existing shadow entry (timers already register here),
+ *   2. handle-token table (in case a token value shows up),
+ *   3. auto-created host object seeded from the guest DISPATCHER_HEADER.
+ *
+ * Without step 3 the wait fell through to a raw guest pointer as a HANDLE,
+ * WaitForSingleObjectEx failed instantly, and a title polling such an object
+ * spun (MVP 06: 175M KeWaitForMultipleObjects calls in ~50 s, zero progress).
+ * Both the set and wait paths must go through here so they converge on one
+ * host primitive per guest VA. */
+static HANDLE bridge_ke_object(uint32_t va)
+{
+    uint8_t *hdr;
+    HANDLE h;
+
+    if (!va)
+        return NULL;
+    h = ke_shadow_lookup(va);
+    if (h)
+        return h;
+    /* Only a tagged value is a handle token. bridge_resolve_handle passes
+     * *untagged* values through as raw handles -- right for dummy handles,
+     * wrong here, where the value is a guest dispatcher-object pointer that
+     * must reach the header path below instead of a doomed native wait.
+     * (0xFF000000-mask tag; the #define lives further down the file.) */
+    if ((va & 0xFF000000u) == 0x48000000u) {
+        h = bridge_resolve_handle(va);
+        if (h)
+            return h;
+    }
+    if (va < 0x10000 || va >= 0x10000000)
+        return NULL;
+    hdr = XBOX_TO_NATIVE(va);
+    if (!hdr)
+        return NULL;
+
+    InitOnceExecuteOnce(&g_ke_obj_once, bridge_ke_object_cs_init, NULL, NULL);
+
+    EnterCriticalSection(&g_ke_obj_cs);
+    h = ke_shadow_lookup(va);            /* re-check under the lock */
+    if (!h) {
+        uint8_t type = hdr[0];
+        int32_t state = 0, limit = 0x7FFFFFFF;
+        memcpy(&state, hdr + 4, sizeof(state));
+        if (type == 0)                   /* NotificationEvent */
+            h = CreateEventW(NULL, TRUE, state != 0, NULL);
+        else if (type == 1)              /* SynchronizationEvent */
+            h = CreateEventW(NULL, FALSE, state != 0, NULL);
+        else if (type == 2) {            /* KSEMAPHORE (+0x10 Limit) */
+            memcpy(&limit, hdr + 0x10, sizeof(limit));
+            if (state < 0) state = 0;
+            if (limit < state) limit = state > 0 ? state : 1;
+            h = CreateSemaphoreW(NULL, state, limit, NULL);
+        }
+        if (h) {
+            fprintf(stderr, "  [KEOBJ] auto-shadow VA 0x%08X type=%u state=%d"
+                    " hdr=%02X %02X %02X %02X -> host %p\n",
+                    va, type, state,
+                    hdr[0], hdr[1], hdr[2], hdr[3], h);
+            fflush(stderr);
+            ke_shadow_insert(va, h);
+        } else {
+            static uint32_t declined = 0;
+            if (declined++ < 10) {
+                fprintf(stderr, "  [KEOBJ] VA 0x%08X not a dispatcher header"
+                        " (type=%u); wait will fail as before\n", va, type);
+                fflush(stderr);
+            }
+        }
+    }
+    LeaveCriticalSection(&g_ke_obj_cs);
+    return h;
+}
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
@@ -1331,11 +1423,7 @@ static void bridge_KeSetEvent(void)
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = bridge_resolve_handle(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
+    h = bridge_ke_object(guest_va);
     if (h)
         g_eax = (uint32_t)SetEvent(h);
     else
@@ -1352,15 +1440,34 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
-    h = ke_shadow_lookup(object);
-    if (!h)
-        h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
+    h = bridge_ke_object(object);
+
+    /* Spin diagnosis: a title polling an unsignalled object shows up here as
+     * millions of instant returns. Log the first few calls with the resolved
+     * object, so the object kind is identifiable from one run. */
+    {
+        static uint32_t calls = 0;
+        if (calls < 10 || (calls & 0xFFFFF) == 0) {
+            fprintf(stderr, "  [KEWAIT] #%u obj=0x%08X -> host=%p reason=%u "
+                    "timeout_ptr=0x%08X\n",
+                    calls, object, h, wait_reason, timeout_ptr);
+            fflush(stderr);
+        }
+        calls++;
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+
+    {
+        static uint32_t logged = 0;
+        if (logged < 10 || (logged & 0xFFFFF) == 0) {
+            fprintf(stderr, "  [KEWAIT]   -> status=0x%08X\n", g_eax);
+            fflush(stderr);
+        }
+        logged++;
+    }
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -4048,8 +4155,23 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
+
+    {
+        static uint32_t calls = 0;
+        if (calls < 10 || (calls & 0xFFFFF) == 0) {
+            fprintf(stderr, "  [KEMWAIT] #%u count=%u type=%u timeout=0x%08X:",
+                    calls, count, wait_type, timeout_va);
+            for (i = 0; i < count && i < 4; i++)
+                fprintf(stderr, " 0x%08X",
+                        objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+        calls++;
+    }
+
     for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(
+        handles[i] = bridge_ke_object(
             objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(

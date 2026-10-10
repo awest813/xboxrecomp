@@ -2346,8 +2346,6 @@ class Lifter:
         targets = self.jump_table_targets.get(table_va)
         if targets is None:
             targets = self._read_jump_table(table_va)
-        if not targets:
-            return []
         # Truncate at the first entry outside the function rather than
         # demanding that every entry be inside it.
         #
@@ -2373,6 +2371,40 @@ class Lifter:
         # likely a coincidence than a jump table.
         if len(inside) >= 2:
             return inside
+        # Downward-indexed tables: `jmp [neg_reg*4 + base]` reads entries
+        # BELOW the base, which _read_jump_table (reading upward) cannot see
+        # -- it stops at the first non-address and the switch resolves to
+        # nothing, becoming an unresolvable ITAIL. MSVC CRT memcpy's small
+        # backward-count table at base+0x2F88 (entries at base-0x1C..base-4)
+        # is the shape. The emitted comparison code is unchanged: at runtime
+        # the negative index reads one of these entries, and comparing that
+        # value against the collected targets dispatches correctly.
+        if self.xbe_data:
+            for probe_base in (table_va - 32, table_va, table_va + 4):
+                off = va_to_file_offset(probe_base)
+                if off is None:
+                    continue
+                dwords = [struct.unpack_from('<I', self.xbe_data,
+                                             off + i * 4)[0]
+                          for i in range(8)]
+                # Longest run of consecutive in-function entries.
+                best, cur = [], []
+                for val in dwords:
+                    if (is_code_address(val)
+                            and self.func_start <= val < self.func_end):
+                        cur = cur + [val]
+                        if len(cur) > len(best):
+                            best = cur
+                    else:
+                        cur = []
+                # probe_base == table_va+4 covers tables whose first dword
+                # overlaps the preceding jmp instruction's bytes (memcpy's
+                # alignment tables at 0x442D50/0x442EDC read 0x9000442D);
+                # the -32 probe covers negative-index tables. Either way the
+                # runtime index still computes the address the way the guest
+                # did, and the value read is one of these targets.
+                if len(best) >= 2:
+                    return best
         return []
 
     def _lift_jmp(self, insn, ops):

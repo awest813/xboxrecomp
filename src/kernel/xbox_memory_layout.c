@@ -1971,6 +1971,21 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
+                /* GP/EP DSP data memory is plain RAM on hardware: above the
+                 * 256-voice register block (256 * 0x300 == 0x30000) the
+                 * aperture is data DirectSound block-copies through (MVP 06
+                 * memmoves GP memory at 0xFE830200 during voice setup). The
+                 * single-instruction MMIO hook cannot emulate a bulk copy,
+                 * so those faults are fatal rather than serviced; keep the
+                 * data span readable/writable and only the register block
+                 * trapped. Same shape as burnout3's fix/apu-dsp-memory-
+                 * untrapped. */
+                if (g_apu_mmio_trapped) {
+                    DWORD op2;
+                    VirtualProtect((char *)g_mcpx_memory + 0x00030000,
+                                   0x00080000u - 0x00030000,
+                                   PAGE_READWRITE, &op2);
+                }
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
@@ -2519,8 +2534,18 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
  * the GPU-instance bridge, so the two do not meet until the window is full.
  * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+ * title allocates once.
+ *
+ * The first 64 KB of the window stay reserved. On hardware that is the
+ * kernel's low page (real-mode IVT, kernel start) and no title memory lands
+ * there; here the fake kernel PE sits at 0x80010000 and XPP builds its
+ * device-enum descriptors at the window base regardless. MVP 06's EA bucket
+ * heap was the first contiguous allocation and landed exactly on those
+ * descriptors -- its free-list heads then walked XPP's "RAM" string as block
+ * headers and crashed on 0xCCCCCCCC poison. Skipping the low 64 KB matches
+ * the hardware convention that nothing ordinary lives at physical zero. */
+#define XBOX_CONTIG_LOW_RESERVE 0x10000u
+static uint32_t g_contig_next = XBOX_CONTIG_BASE + XBOX_CONTIG_LOW_RESERVE;
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {

@@ -742,27 +742,44 @@ class FunctionTranslator:
                     imm_refs.add(value)
         self.lifter.imm_code_refs = imm_refs
 
-        # Collect switch table targets as extra block leaders
+        # Collect switch table targets as extra block leaders, and keep
+        # iterating until the decode and the leaders agree.
+        #
+        # One pass is not enough: the linear decode stops at the first byte
+        # capstone cannot decode, and an embedded jump table is exactly that
+        # (MSVC CRT memcpy: the forward tables' dwords stop the decode at
+        # 0x442DF5, before any of the backward-path indirect jumps exist in
+        # the instruction list). The first resync re-decodes from the forward
+        # tables' targets and recovers the backward jumps -- whose own tables
+        # then contribute NEW leaders. Without the loop those second-order
+        # targets stay missing, their labels never exist, and the switch arms
+        # compile to no-ops ahead of an unresolved indirect branch.
         switch_leaders = set(imm_refs)
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                targets = self.lifter._analyze_switch_table(insn.operands)
-                for t in targets:
-                    if start <= t < end:
-                        switch_leaders.add(t)
-
-        # A switch target the decode never produced an instruction for cannot
-        # become a block leader, so it gets no label and its `goto` is dropped
-        # as dead code -- the case then falls through to an unresolved indirect
-        # branch. That happens whenever the jump table sits in .text ahead of
-        # the code it points at: decoding the table as instructions leaves the
-        # stream misaligned across the first case. Re-decode, telling the
-        # disassembler where the real instruction boundaries are.
         if recovered is None:
-            missing = switch_leaders - {insn.address for insn in instructions}
-            if missing:
+            for _ in range(4):
+                for insn in instructions:
+                    if (insn.mnemonic == "jmp" and not insn.jump_target
+                            and insn.operands):
+                        targets = self.lifter._analyze_switch_table(
+                            insn.operands)
+                        for t in targets:
+                            if start <= t < end:
+                                switch_leaders.add(t)
+                missing = switch_leaders - {insn.address
+                                            for insn in instructions}
+                if not missing:
+                    break
                 instructions = self.disasm.disassemble_function(
-                    raw_bytes, start, end, resync=missing)
+                    raw_bytes, start, end, resync=switch_leaders)
+        else:
+            for insn in instructions:
+                if (insn.mnemonic == "jmp" and not insn.jump_target
+                        and insn.operands):
+                    targets = self.lifter._analyze_switch_table(
+                        insn.operands)
+                    for t in targets:
+                        if start <= t < end:
+                            switch_leaders.add(t)
 
         # Build basic blocks
         blocks = self.disasm.build_basic_blocks(
@@ -954,10 +971,17 @@ class FunctionTranslator:
         elif "ebp" in used_regs:
             lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
 
-        # Add _flags variable if function has conditional instructions
+        # Add _flags variable if function has conditional instructions.
+        # rep-prefixed compare string ops (repe scasd, repne cmpsb, ...) emit
+        # a _flags-reading loop without any jcc/setcc/cmovc in the instruction
+        # stream, so they must count as conditional here too; without this the
+        # emitted loop references an undeclared identifier and MSVC rejects the
+        # whole translation unit (seen on MVP 06's sub_0023B026).
         has_conditionals = any(
             insn.is_cond_jump or insn.mnemonic.startswith("set")
             or insn.mnemonic.startswith("cmov")
+            or (insn.mnemonic.startswith("rep")
+                and ("cmps" in insn.mnemonic or "scas" in insn.mnemonic))
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
