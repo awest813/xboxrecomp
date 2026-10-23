@@ -1,0 +1,180 @@
+/* Original x86 versus the lift, with five controlled callees. Build as x86. */
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#define RECOMP_GENERATED_CODE
+#include "recomp_types.h"
+ptrdiff_t g_xbox_mem_offset;
+uint32_t g_xbox_code_lo=0x10000,g_xbox_code_hi=0x600000;
+RECOMP_TLS uint32_t g_eax,g_ecx,g_edx,g_esp,g_ebx,g_esi,g_edi,g_ebp,g_seh_ebp;
+RECOMP_TLS int g_df;
+RECOMP_TLS RecompXmm g_xmm0;
+volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE],g_icall_trace_idx;
+volatile uint64_t g_icall_count;
+recomp_func_t recomp_lookup(uint32_t va){return NULL;}
+recomp_func_t recomp_lookup_manual(uint32_t va){return NULL;}
+recomp_func_t recomp_lookup_kernel(uint32_t va){return NULL;}
+void recomp_icall_fail_log(uint32_t va){fprintf(stderr,"miss %08X\n",va);exit(3);}
+void recomp_icall_not_code_log(uint32_t va){fprintf(stderr,"bad %08X\n",va);exit(4);}
+static const unsigned nargs[]={2,3,2,0,1};
+static uint32_t records[8][5],count,helper_value;
+static void fixture(unsigned id,uint32_t cx,uint32_t *args)
+{
+    unsigned i;uint32_t *r;
+    if(count>=8)abort();
+    r=records[count++];
+    r[0]=id;r[1]=cx;
+    for(i=0;i<nargs[id];i++)r[i+2]=args[i];
+}
+static void lifted(unsigned id)
+{
+    fixture(id,g_ecx,(uint32_t*)(g_esp+4));
+    g_eax=id==3?helper_value:0x12340000+id;
+    g_esp+=4+nargs[id]*4;
+}
+void sub_00017070(void){lifted(0);}
+void sub_000397A0(void){lifted(1);}
+void sub_00039630(void){lifted(2);}
+void sub_00017310(void){lifted(3);}
+void sub_000172F0(void){lifted(4);}
+@BODY@
+#undef eax
+#undef ecx
+#undef edx
+#undef esp
+#undef ebx
+#undef esi
+#undef edi
+#undef ebp
+static void native_record(unsigned id,uint32_t *r)
+{
+    fixture(id,r[6],(uint32_t*)(r[3]+4));
+    r[7]=id==3?helper_value:0x12340000+id;
+}
+#define STUB(name,id,bytes) __declspec(naked) static void name(void) { \
+    __asm pushad \
+    __asm push esp \
+    __asm push id \
+    __asm call native_record \
+    __asm add esp,8 \
+    __asm popad \
+    __asm ret bytes \
+}
+STUB(n0,0,8)
+STUB(n1,1,12)
+STUB(n2,2,8)
+STUB(n3,3,0)
+STUB(n4,4,4)
+static uint32_t host_sp,native_regs[8];
+static void *native_fn;
+__declspec(naked) static void original(void)
+{
+    __asm {
+        push ebx
+        push esi
+        push edi
+        push ebp
+        mov host_sp,esp
+        mov esp,2100F004h
+        sub esp,16
+        mov ecx,21001000h
+        mov eax,11223344h
+        mov edx,22334455h
+        mov ebx,12345678h
+        mov esi,55667788h
+        mov edi,11223344h
+        mov ebp,32103210h
+        call dword ptr [native_fn]
+        mov native_regs[0],eax
+        mov native_regs[4],ecx
+        mov native_regs[8],edx
+        mov native_regs[12],ebx
+        mov native_regs[16],esi
+        mov native_regs[20],edi
+        mov native_regs[24],ebp
+        mov native_regs[28],esp
+        mov esp,host_sp
+        pop ebp
+        pop edi
+        pop esi
+        pop ebx
+        ret
+    }
+}
+static unsigned char initial[0xE000],expected[0xE000];
+static void check(uint32_t event,unsigned state)
+{
+    uint32_t expected_records[8][5],expected_count,actual[8];
+    memset((void*)0x21000000,0,0x10000);
+    *(uint32_t*)0x2100108C=(state&1)?0x21003000:0;
+    *(uint32_t*)0x21003738=0x21004000;
+    *(uint32_t*)0x21004018=0x21005000;
+    *(float*)0x210053DC=(float)((int)(state%7)-3)*0.75f;
+    *(uint32_t*)0x210010B4=state>>1;
+    *(uint8_t*)0x210010BD=(state>>2)&1;
+    helper_value=(state>>1)+((state>>3)&1);
+    *(uint32_t*)0x2100EFF4=2;*(uint32_t*)0x2100EFF8=event;
+    *(uint32_t*)0x2100EFFC=0xABCDEF12;*(uint32_t*)0x2100F000=0xDEADBEEF;
+    memcpy(initial,(void*)0x21000000,sizeof initial);
+    memset(records,0,sizeof records);count=0;
+    original();
+    memcpy(expected,(void*)0x21000000,sizeof expected);
+    memcpy(expected_records,records,sizeof records);expected_count=count;
+    memcpy((void*)0x21000000,initial,sizeof initial);
+    memset(records,0,sizeof records);count=0;
+    g_esp=0x2100EFF0;MEM32(g_esp)=0x12345678;
+    g_eax=0x11223344;g_edx=0x22334455;g_ecx=0x21001000;
+    g_ebx=0x12345678;g_esi=0x55667788;g_edi=0x11223344;
+    g_ebp=g_seh_ebp=0x32103210;g_df=0;
+    sub_0003DD40();
+    actual[0]=g_eax;actual[1]=g_ecx;actual[2]=g_edx;actual[3]=g_ebx;
+    actual[4]=g_esi;actual[5]=g_edi;actual[6]=g_ebp;actual[7]=g_esp;
+    if(memcmp(actual,native_regs,sizeof actual) || count!=expected_count ||
+       memcmp(records,expected_records,sizeof records) ||
+       memcmp((void*)0x21000000,expected,sizeof expected) || g_df) {
+        unsigned i;
+        fprintf(stderr,"FAIL event=%08X state=%u calls=%u/%u\n",event,state,count,expected_count);
+        for(i=0;i<8;i++)fprintf(stderr,"reg%u=%08X/%08X\n",i,actual[i],native_regs[i]);
+        exit(2);
+    }
+}
+int main(int argc,char **argv)
+{
+    FILE *f;unsigned i,j;
+    static const uint32_t calls[]={0x38,0x68,0x77,0x8E,0xA3};
+    void (*stubs[])(void)={n0,n1,n2,n3,n4};
+    if(argc!=2)return 10;
+    {
+        static const uint32_t bases[]={0x23000000,0x21000000};
+        for(i=0;i<2;i++)if(!VirtualAlloc((void*)bases[i],0x10000,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE)) {
+            fprintf(stderr,"Allocation %08X failed: %lu\n",bases[i],GetLastError());return 11;
+        }
+    }
+    native_fn=VirtualAlloc(NULL,0x10000,MEM_RESERVE|MEM_COMMIT,PAGE_EXECUTE_READWRITE);
+    if(!native_fn)return 11;
+    f=fopen(argv[1],"rb");if(!f)return 12;
+    fseek(f,@OFFSET@,SEEK_SET);if(fread(native_fn,1,0x108,f)!=0x108)return 13;
+    memcpy((void*)0x23000000,native_fn,0x108);
+    fseek(f,@CONSTANT@,SEEK_SET);if(fread((void*)0x23001000,1,4,f)!=4)return 14;
+    fclose(f);
+    for(i=0;i<5;i++) {
+        uint8_t *call=(uint8_t*)native_fn+calls[i];
+        if(*call!=0xE8)return 15;
+        *(uint32_t*)(call+1)=(uint32_t)(uintptr_t)stubs[i]-(uint32_t)(uintptr_t)call-5;
+    }
+    /* Relocate the original's two absolute table operands and scalar constant;
+     * preserve the original low-address entries in the lifted table copy. */
+    *(uint32_t*)((uint8_t*)native_fn+0x27)=(uint32_t)(uintptr_t)native_fn+0xD0;
+    *(uint32_t*)((uint8_t*)native_fn+0x2E)=(uint32_t)(uintptr_t)native_fn+0xB8;
+    *(uint32_t*)((uint8_t*)native_fn+0x5D)=0x23001000;
+    for(i=0;i<6;i++) {
+        uint32_t *entry=(uint32_t*)((uint8_t*)native_fn+0xB8+i*4);
+        *entry=(uint32_t)(uintptr_t)native_fn+*entry-0x3DD40;
+    }
+    for(j=0;j<32;j++) {
+        for(i=0;i<256;i++)check(i,j);
+        check(0xFFFFFFFF,j);check(0x80000000,j);check(0x7FFFFFFF,j);
+    }
+    puts("PASS: 8288 original-x86/lifted event-switch comparisons; six arms, defaults, memory, calls, registers and RET 16");
+    return 0;
+}

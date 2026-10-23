@@ -6,7 +6,12 @@ add_library(xbox_usb STATIC
 )
 
 target_include_directories(xbox_usb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(xbox_usb PUBLIC platform xbox_input)
+target_link_libraries(xbox_usb PUBLIC platform xbox_input xbox_guest_memory)
+
+if(WIN32)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/ohci_dma_smoke
+                     ${CMAKE_CURRENT_BINARY_DIR}/ohci_dma_smoke)
+endif()
 
 if(MSVC)
     target_compile_options(xbox_usb PRIVATE /W4 /O2)

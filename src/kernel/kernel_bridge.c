@@ -26,6 +26,9 @@
  */
 
 #include "kernel.h"
+#include "kernel_thread_object.h"
+#include "kernel_dpc_queue.h"
+#include "kernel_dispatcher.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -36,12 +39,18 @@
  * allocation. MSVC says so (C4013 + C4047 "differs in levels of indirection")
  * but only as warnings, and this file is compiled with /W4 /WX-. */
 #include <stdlib.h>
+#include "kernel_guest.h"
+#include "platform/guest_memory.h"
+#include "nv2a_trap.h"
+#include "nv2a_ack.h"
+#include "nv2a_vblank_clock.h"
 #include <float.h>
 /* Section B string helpers: wcslen helper, case folding.
  * ctype.h/wctype.h are not pulled in by the platform headers on either host. */
 #include <string.h>
 #include <ctype.h>
 #include <wctype.h>
+#include "kernel_handles.h"
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
@@ -401,11 +410,13 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
                                      uint32_t ctx2)
 {
+    xbox_MemoryEnter();
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx2;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     g_seh_ebp = g_esp;
-    fn();
+    xbox_MemoryLeave();
+    xbox_GuestCall(fn);
     g_esp += 12;
 }
 
@@ -519,7 +530,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+    xbox_GuestCall(fn);
                 g_esp += 12;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
@@ -598,8 +609,9 @@ static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
 
-    if (KERNEL_LOG_ON()) {
-        fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
+    if (KERNEL_LOG_ON() || getenv("RECOMP_HANDLE_TRACE")) {
+        fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X caller=0x%08X tid=%lu\n",
+                raw_handle, g_xbox_kernel_caller, (unsigned long)GetCurrentThreadId());
         fflush(stderr);
     }
 
@@ -1318,98 +1330,35 @@ static void bridge_NtCreateEvent(void)
 
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
+static void ke_shadow_remove(uint32_t guest_va);
 static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE bridge_ke_object(uint32_t va);
 
-/* Serializes auto-shadow creation below; a plain ke_shadow_insert is
- * last-wins, so two threads minting objects for one VA must not race. */
-static INIT_ONCE g_ke_obj_once = INIT_ONCE_STATIC_INIT;
-static CRITICAL_SECTION g_ke_obj_cs;
-
-static BOOL CALLBACK bridge_ke_object_cs_init(PINIT_ONCE o, PVOID p, PVOID *ctx)
-{
-    (void)o; (void)p; (void)ctx;
-    InitializeCriticalSection(&g_ke_obj_cs);
-    return TRUE;
-}
-
-/* Resolve a kernel-mode dispatcher object for the Ke* family.
- *
- * Xbox kernel code waits on the *object pointer* directly -- a KEVENT or
- * KSEMAPHORE embedded in any guest structure -- while NtCreateEvent hands
- * out handle tokens. A guest VA therefore resolves in this order:
- *
- *   1. existing shadow entry (timers already register here),
- *   2. handle-token table (in case a token value shows up),
- *   3. auto-created host object seeded from the guest DISPATCHER_HEADER.
- *
- * Without step 3 the wait fell through to a raw guest pointer as a HANDLE,
- * WaitForSingleObjectEx failed instantly, and a title polling such an object
- * spun (MVP 06: 175M KeWaitForMultipleObjects calls in ~50 s, zero progress).
- * Both the set and wait paths must go through here so they converge on one
- * host primitive per guest VA. */
+/* Host-backed dispatcher objects (timers/threads) and tagged Nt handles.
+ * Inline XDK events/semaphores instead use their guest SignalState below. */
 static HANDLE bridge_ke_object(uint32_t va)
 {
-    uint8_t *hdr;
     HANDLE h;
-
     if (!va)
         return NULL;
     h = ke_shadow_lookup(va);
     if (h)
         return h;
-    /* Only a tagged value is a handle token. bridge_resolve_handle passes
-     * *untagged* values through as raw handles -- right for dummy handles,
-     * wrong here, where the value is a guest dispatcher-object pointer that
-     * must reach the header path below instead of a doomed native wait.
-     * (0xFF000000-mask tag; the #define lives further down the file.) */
-    if ((va & 0xFF000000u) == 0x48000000u) {
-        h = bridge_resolve_handle(va);
-        if (h)
-            return h;
-    }
-    if (va < 0x10000 || va >= 0x10000000)
-        return NULL;
-    hdr = XBOX_TO_NATIVE(va);
-    if (!hdr)
-        return NULL;
+    h = xbox_ThreadObjectHost(va);
+    if (h)
+        return h;
+    return (va & 0xFF000000u) == 0x48000000u ? bridge_resolve_handle(va) : NULL;
+}
 
-    InitOnceExecuteOnce(&g_ke_obj_once, bridge_ke_object_cs_init, NULL, NULL);
-
-    EnterCriticalSection(&g_ke_obj_cs);
-    h = ke_shadow_lookup(va);            /* re-check under the lock */
-    if (!h) {
-        uint8_t type = hdr[0];
-        int32_t state = 0, limit = 0x7FFFFFFF;
-        memcpy(&state, hdr + 4, sizeof(state));
-        if (type == 0)                   /* NotificationEvent */
-            h = CreateEventW(NULL, TRUE, state != 0, NULL);
-        else if (type == 1)              /* SynchronizationEvent */
-            h = CreateEventW(NULL, FALSE, state != 0, NULL);
-        else if (type == 2) {            /* KSEMAPHORE (+0x10 Limit) */
-            memcpy(&limit, hdr + 0x10, sizeof(limit));
-            if (state < 0) state = 0;
-            if (limit < state) limit = state > 0 ? state : 1;
-            h = CreateSemaphoreW(NULL, state, limit, NULL);
-        }
-        if (h) {
-            fprintf(stderr, "  [KEOBJ] auto-shadow VA 0x%08X type=%u state=%d"
-                    " hdr=%02X %02X %02X %02X -> host %p\n",
-                    va, type, state,
-                    hdr[0], hdr[1], hdr[2], hdr[3], h);
-            fflush(stderr);
-            ke_shadow_insert(va, h);
-        } else {
-            static uint32_t declined = 0;
-            if (declined++ < 10) {
-                fprintf(stderr, "  [KEOBJ] VA 0x%08X not a dispatcher header"
-                        " (type=%u); wait will fail as before\n", va, type);
-                fflush(stderr);
-            }
-        }
-    }
-    LeaveCriticalSection(&g_ke_obj_cs);
-    return h;
+static void *bridge_guest_dispatcher(uint32_t va)
+{
+    /* Bounds include ordinary RAM and the contiguous driver arena. Reject
+     * arbitrary values before inspecting a header; Size is in DWORDs. */
+    if (!((va >= 0x10000u && va <= XBOX_TOTAL_RAM - 20u)
+            || (va >= XBOX_CONTIG_BASE && va <= XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - 20u)))
+        return NULL;
+    if (ke_shadow_lookup(va)) return NULL;
+    return xbox_DispatcherIsGuestObject(XBOX_TO_NATIVE(va)) ? XBOX_TO_NATIVE(va) : NULL;
 }
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
@@ -1419,9 +1368,15 @@ static void bridge_KeSetEvent(void)
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
     HANDLE h;
+    void *guest = bridge_guest_dispatcher(guest_va);
 
     (void)increment;
     (void)wait;
+
+    if (guest) {
+        g_eax = (uint32_t)xbox_DispatcherSetEvent(guest);
+        return;
+    }
 
     h = bridge_ke_object(guest_va);
     if (h)
@@ -1456,9 +1411,26 @@ static void bridge_KeWaitForSingleObject(void)
         calls++;
     }
 
-    g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        h, wait_reason, wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    {
+        XboxDispatcherWaitItem item = { bridge_guest_dispatcher(object), h };
+        uint32_t caller = g_xbox_kernel_caller;
+        uint32_t header = item.guest ? *(uint32_t *)item.guest : 0;
+        uint32_t signal = item.guest ? *((uint32_t *)item.guest + 1) : 0;
+        ULONGLONG began = GetTickCount64();
+        g_eax = item.guest ? (uint32_t)xbox_DispatcherWait(1, &item, 0,
+                    (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr))
+                : (uint32_t)xbox_KeWaitForSingleObject(h, wait_reason, wait_mode,
+                    (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        if (getenv("RECOMP_WAIT_TRACE")) {
+            static LONG traced;
+            if (InterlockedIncrement(&traced) <= 1024)
+                fprintf(stderr, "  [WAITTRACE] caller=%08X obj=%08X guest=%u header=%08X signal=%u->%u status=%08X ms=%llu timeout=%lld\n",
+                        caller, object, !!item.guest, header, signal,
+                        item.guest ? *((uint32_t *)item.guest + 1) : 0, g_eax,
+                        (unsigned long long)(GetTickCount64()-began),
+                        timeout_ptr ? ((LARGE_INTEGER *)XBOX_TO_NATIVE(timeout_ptr))->QuadPart : 0);
+        }
+    }
 
     {
         static uint32_t logged = 0;
@@ -1677,7 +1649,7 @@ static void bridge_NtUserIoApcDispatcher(void)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = information;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = (status == 0) ? 0 : status;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    xbox_GuestCall(fn);
 
     g_eax = 0;
 }
@@ -1838,6 +1810,7 @@ static void bridge_PsTerminateSystemThread(void)
          * to do it. */
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
+        xbox_MemorySuspend(); /* ExitThread bypasses the bridge's lease cleanup. */
         ExitThread(exit_status);
     }
 }
@@ -1870,11 +1843,8 @@ static void bridge_HalReadSMCTrayState(void)
  * interrupt enable and queues here, and the enumeration it should have started
  * lives entirely in the deferred routine.
  *
- * ponytail: runs the routine inline rather than queueing it. A real DPC runs
- * at DISPATCH_LEVEL shortly after the ISR returns, and this runs it before the
- * ISR returns, on whichever thread queued it. That ordering difference has not
- * mattered for anything here yet; when it does, the upgrade is a real queue
- * drained by the thread that lowered IRQL, not a second call site.
+ * Deferred work is queued once per KDPC and drained by the timer thread after
+ * the ISR. The queue module serializes producers and tracks KDPC.Inserted.
  */
 /* Run a DPC's deferred routine on the calling thread.
  *
@@ -1886,9 +1856,13 @@ static void bridge_HalReadSMCTrayState(void)
  *
  * Returns 1 if the routine was found and called.
  */
-static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+static XBOX_THREAD_LOCAL int s_in_gpu_isr;
+static uint32_t s_gpu_dpc;
+
+static int kernel_run_dpc_body(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     uint32_t routine, context;
+    KIRQL old_irql;
     recomp_func_t fn;
 
     if (!dpc_va)
@@ -1910,13 +1884,24 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
+    old_irql = xbox_KeRaiseIrqlToDpcLevel();
     g_esp -= 4; BRIDGE_MEM32(g_esp) = arg2;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = arg1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    xbox_GuestCall(fn);
+    xbox_KfLowerIrql(old_irql);
     return 1;
+}
+
+static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+{
+    int result;
+    xbox_MemoryEnter();
+    result=kernel_run_dpc_body(dpc_va,arg1,arg2);
+    xbox_MemoryLeave();
+    return result;
 }
 
 /* -- KeSynchronizeExecution (ordinal 153) ------------------
@@ -1930,15 +1915,15 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
  * ran -- the same failure as an unqueued DPC, and just as quiet: the driver
  * asks for exclusive access, is told it did not get it, and skips the work.
  *
- * ponytail: no lock is taken. Nothing else here runs at ISR IRQL, and the one
- * caller that matters is a device model on its own thread; if two of those
- * ever contend, this wants the interrupt object's own lock rather than a
- * global one.
+ * The shared raised-IRQL gate excludes device callbacks and other protected
+ * driver regions until this routine returns.
  */
 static void bridge_KeSynchronizeExecution(void)
 {
+    uint32_t kint = STACK_ARG(0);
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
+    KIRQL old_irql;
     recomp_func_t fn;
 
     fn = routine ? recomp_lookup(routine) : NULL;
@@ -1953,23 +1938,18 @@ static void bridge_KeSynchronizeExecution(void)
 
     /* BOOLEAN SynchronizeRoutine(PVOID Context), __stdcall. Its `ret 4` takes
      * the dummy return address and the argument, so g_esp needs no fixup. */
+    old_irql = xbox_KfRaiseIrql(BRIDGE_MEM8(kint + 12));
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    xbox_GuestCall(fn);
+    xbox_KfLowerIrql(old_irql);
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
-/* -- KeRemoveQueueDpc (ordinal 137) ------------------------
- * BOOLEAN KeRemoveQueueDpc(PKDPC Dpc)
- *
- * Cancels a queued DPC, returning whether it was still in the queue. DPCs run
- * inline here (see KeInsertQueueDpc), so by the time anyone can call this the
- * routine has already run and there is nothing to cancel. FALSE is both the
- * honest answer and the one that keeps a caller's bookkeeping right.
- */
+/* -- KeRemoveQueueDpc (ordinal 137) ------------------------ */
 static void bridge_KeRemoveQueueDpc(void)
 {
-    g_eax = 0;
+    g_eax = (uint32_t)xbox_DpcQueueRemove(STACK_ARG(0));
 }
 
 /* The pending DPC queue.
@@ -1989,33 +1969,10 @@ static void bridge_KeRemoveQueueDpc(void)
  * DPC runs on the next drain rather than immediately. Nothing here depends on
  * DPC ordering beyond "after the ISR".
  */
-#define XBOX_MAX_PENDING_DPC 64
-typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
-static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
-static volatile LONG g_dpc_head, g_dpc_tail;
-
 static void bridge_KeInsertQueueDpc(void)
 {
-    uint32_t dpc  = STACK_ARG(0);
-    uint32_t arg1 = STACK_ARG(1);
-    uint32_t arg2 = STACK_ARG(2);
-    LONG tail, next;
-
-    if (!dpc) { g_eax = 0; return; }
-
-    tail = g_dpc_tail;
-    next = (tail + 1) % XBOX_MAX_PENDING_DPC;
-    if (next == g_dpc_head) {
-        fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
-        fflush(stderr);
-        g_eax = 0;
-        return;
-    }
-    g_dpc_queue[tail].dpc  = dpc;
-    g_dpc_queue[tail].arg1 = arg1;
-    g_dpc_queue[tail].arg2 = arg2;
-    g_dpc_tail = next;
-    g_eax = 1;
+    if(s_in_gpu_isr)s_gpu_dpc=STACK_ARG(0);
+    g_eax = (uint32_t)xbox_DpcQueueInsert(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
 }
 
 /* Call a connected interrupt service routine.
@@ -2030,11 +1987,13 @@ static void bridge_KeInsertQueueDpc(void)
  */
 uint32_t xbox_GetConnectedInterrupt(uint32_t vector);   /* defined below */
 
-static int kernel_raise_interrupt(uint32_t vector)
+static int kernel_raise_interrupt_body(uint32_t vector)
 {
     uint32_t kint = xbox_GetConnectedInterrupt(vector);
     uint32_t routine, context;
     recomp_func_t fn;
+    KIRQL old_irql;
+    int previous_gpu_isr;
 
     if (!kint)
         return -1;
@@ -2047,11 +2006,25 @@ static int kernel_raise_interrupt(uint32_t vector)
     if (!fn)
         return -1;
 
+    old_irql = xbox_KfRaiseIrql(BRIDGE_MEM8(kint + 12));
+    previous_gpu_isr=s_in_gpu_isr;
+    s_in_gpu_isr=vector==0x33u;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    xbox_GuestCall(fn);
+    s_in_gpu_isr=previous_gpu_isr;
+    xbox_KfLowerIrql(old_irql);
     return (int)(g_eax & 1u);
+}
+
+static int kernel_raise_interrupt(uint32_t vector)
+{
+    int result;
+    xbox_MemoryEnter();
+    result=kernel_raise_interrupt_body(vector);
+    xbox_MemoryLeave();
+    return result;
 }
 
 /* The GPU's vertical blank, delivered rather than merely enabled.
@@ -2078,33 +2051,67 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PMC_INTR_PCRTC    (1u << 24)
 #define NV2A_PCRTC_INTR_0      0x00600100u
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
-#define NV2A_VECTOR            3u
+#define NV2A_VECTOR            0x33u
+
+static int kernel_ensure_timer_thread(void);
+static void kernel_nv2a_request_interrupt(void *unused)
+{
+    (void)unused;
+    kernel_ensure_timer_thread();
+}
+
+void xbox_Nv2aSoftwareMethod(uint32_t parameter)
+{
+    nv2a_trap_dispatch(XBOX_TO_NATIVE(XBOX_NV2A_REG_BASE),parameter,
+                       kernel_nv2a_request_interrupt,NULL);
+}
+
+static void kernel_nv2a_interrupt_tick(void)
+{
+    /* Level-triggered until the DPC enters PGRAPH's trap handler. Execute
+     * on the timer's guest stack/TIB, never synchronously on the GPU: an
+     * ISR blocked by a DPC would prevent that GPU from retiring the source. */
+    if(BRIDGE_MEM32(XBOX_NV2A_REG_BASE+NV2A_PMC_INTR_0) & 0x1000u)
+        kernel_raise_interrupt(NV2A_VECTOR);
+}
+
+static Nv2aVblankClock s_vblank_clock;
+static uint64_t kernel_vblank_now_us(void)
+{
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER count;
+    uint64_t n,f;
+    if(!frequency.QuadPart)QueryPerformanceFrequency(&frequency);
+    if(!frequency.QuadPart || !QueryPerformanceCounter(&count))
+        return (uint64_t)GetTickCount64()*1000;
+    n=(uint64_t)count.QuadPart;f=(uint64_t)frequency.QuadPart;
+    return (n/f)*1000000+(n%f)*1000000/f;
+}
 
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
 
     if (enabled < 0)
         enabled = getenv("RECOMP_VBLANK") != NULL;
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    if(!nv2a_vblank_due(&s_vblank_clock,kernel_vblank_now_us()))return;
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    nv2a_ack_vblank_publish(XBOX_TO_NATIVE(XBOX_NV2A_REG_BASE));
 
     {
         static unsigned n;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        /* A masked ISR can decline while its earlier DPC is still queued.
+         * Retain that level until the actual PCRTC W1C store; if nobody can
+         * read it, drop it rather than permanently holding a stale source. */
+        if(claimed<0 || !xbox_DpcQueueContains(s_gpu_dpc))
+            nv2a_ack_vblank_drop(XBOX_TO_NATIVE(XBOX_NV2A_REG_BASE));
         if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
@@ -2117,11 +2124,10 @@ static void kernel_vblank_tick(void)
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
 {
-    while (g_dpc_head != g_dpc_tail) {
-        LONG head = g_dpc_head;
-        PendingDpc d = g_dpc_queue[head];
-        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
-        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+    XboxPendingDpc d;
+    while (xbox_DpcQueuePop(&d)) {
+        if(!kernel_run_dpc(d.dpc, d.arg1, d.arg2) && d.dpc==s_gpu_dpc)
+            nv2a_ack_vblank_drop(XBOX_TO_NATIVE(XBOX_NV2A_REG_BASE));
     }
 }
 
@@ -2150,18 +2156,9 @@ static void bridge_KeInitializeDpc(void)
 
 /* ── NV2A interrupt plumbing (ordinals 44, 98, 109) ───────
  *
- * The D3D8 library linked into a title installs an ISR for the GPU's vblank /
- * command-completion interrupt. There is no NV2A here and nothing ever raises
- * that interrupt, so these exist to let initialisation complete rather than to
- * deliver anything.
- *
- * KeConnectInterrupt reports success: reporting failure sends Halo's
- * rasterizer down an error path during preinitialize, and the goal is to get
- * past setup, not to pretend the hardware is broken.
- *
- * ponytail: no interrupt is ever delivered. Code that *waits* on the ISR
- * rather than polling will hang here, and the fix for that is to bridge the
- * D3D8 entry point that owns the wait, not to synthesise NV2A interrupts.
+ * D3D installs the ISR used by vblank and PGRAPH software-method interrupts.
+ * Record its guest object so the timer worker can deliver those sources at
+ * the connected IRQL, then execute the original queued DPCs.
  */
 
 /* ULONG HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql) */
@@ -2170,11 +2167,8 @@ static void bridge_HalGetInterruptVector(void)
     uint32_t level   = STACK_ARG(0);
     uint32_t irql_va = STACK_ARG(1);
 
-    if (irql_va) {
-        /* IRQL is conventionally the vector for device interrupts. */
-        BRIDGE_MEM8(irql_va) = (uint8_t)level;
-    }
-    g_eax = level;
+    g_eax = xbox_HalGetInterruptVector(level,
+            irql_va ? (PKIRQL)XBOX_TO_NATIVE(irql_va) : NULL);
 }
 
 /* VOID KeInitializeInterrupt(PKINTERRUPT, ServiceRoutine, ServiceContext,
@@ -2185,12 +2179,14 @@ static void bridge_KeInitializeInterrupt(void)
     uint32_t routine      = STACK_ARG(1);
     uint32_t context      = STACK_ARG(2);
     uint32_t vector       = STACK_ARG(3);
+    uint8_t irql          = (uint8_t)STACK_ARG(4);
 
     /* Xbox KINTERRUPT is 44 bytes. */
     memset(XBOX_TO_NATIVE(interrupt_va), 0, 44);
     BRIDGE_MEM32(interrupt_va + 0)  = routine;
     BRIDGE_MEM32(interrupt_va + 4)  = context;
     BRIDGE_MEM32(interrupt_va + 8)  = vector;
+    BRIDGE_MEM8(interrupt_va + 12)  = irql;
     g_eax = 0;
 }
 
@@ -2202,10 +2198,9 @@ static void bridge_KeInitializeInterrupt(void)
  * an interrupt at all -- without it the routine is written down in guest
  * memory and nothing on this side knows it is there.
  *
- * A small fixed table rather than a list: an Xbox has 26 interrupt vectors and
- * a title connects a handful, so the whole thing is smaller than the comment.
+ * Use the interrupt-vector namespace, including the PIC's 0x30 base.
  */
-#define XBOX_MAX_VECTORS 32
+#define XBOX_MAX_VECTORS 256
 static uint32_t g_connected_isr[XBOX_MAX_VECTORS];   /* KINTERRUPT guest VA */
 
 /* BOOLEAN KeConnectInterrupt(PKINTERRUPT Interrupt) */
@@ -2374,7 +2369,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(10);
+        Sleep(s_vblank_clock.started ?
+            nv2a_vblank_wait_ms(&s_vblank_clock,kernel_vblank_now_us()) : 10);
+        kernel_nv2a_interrupt_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
@@ -2405,11 +2402,34 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 HANDLE ev = ke_shadow_lookup(fired_va);
                 if (ev) {
                     SetEvent(ev);
+                    xbox_MemoryEnter();
                     BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
+                    xbox_MemoryLeave();
                 }
             }
         }
     }
+}
+
+static INIT_ONCE s_timer_once=INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK kernel_timer_init(PINIT_ONCE once,PVOID param,PVOID *context)
+{
+    HANDLE thread;
+    (void)once;(void)param;(void)context;
+    InitializeCriticalSection(&g_timer_lock);
+    thread=CreateThread(NULL,0,kernel_timer_thread,NULL,0,NULL);
+    if(!thread) {
+        DeleteCriticalSection(&g_timer_lock);
+        return FALSE;
+    }
+    g_timer_started=1;
+    CloseHandle(thread);
+    return TRUE;
+}
+
+static int kernel_ensure_timer_thread(void)
+{
+    return InitOnceExecuteOnce(&s_timer_once,kernel_timer_init,NULL,NULL)!=FALSE;
 }
 
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
@@ -2420,11 +2440,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
-        InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
-    }
+    if (!kernel_ensure_timer_thread()) { g_eax=0;return; }
 
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -2602,43 +2618,17 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
  * Xbox memory. Tokens carry a tag in the high byte so they never collide
  * with the synthetic handles (0xDEAD0001 / 0xBEEF0010) used elsewhere.
  */
-#define BRIDGE_HANDLE_TAG  0x48000000u
-#define BRIDGE_HANDLE_MASK 0x00FFFFFFu
-#define BRIDGE_HANDLE_MAX  16384
-static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
-
-static uint32_t bridge_handle_token(HANDLE h)
-{
-    int i;
-    if (!h || h == INVALID_HANDLE_VALUE) return 0;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == NULL) {
-            s_handle_table[i] = h;
-            return BRIDGE_HANDLE_TAG | (uint32_t)i;
-        }
-    fprintf(stderr, "  [BRIDGE] handle table full\n");
-    return 0;
-}
-
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
 static void bridge_write_handle(uint32_t handle_va, HANDLE h)
 {
     if (handle_va)
-        BRIDGE_MEM32(handle_va) = bridge_handle_token(h);
+        BRIDGE_MEM32(handle_va) = xbox_HandleToken(h);
 }
 
 /* Resolve a 32-bit Xbox handle slot back to a native HANDLE. */
 static HANDLE bridge_read_handle(uint32_t va)
 {
-    uint32_t token = BRIDGE_MEM32(va);
-    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
-        uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
-    }
-    /* Untagged value: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    return xbox_HandleResolve(BRIDGE_MEM32(va));
 }
 
 /* Resolve a token to a HANDLE and release its table slot (for NtClose). */
@@ -2656,25 +2646,14 @@ static HANDLE bridge_read_handle(uint32_t va)
  * which surfaced as "couldn't open or create saved game file". */
 static HANDLE bridge_resolve_handle(uint32_t token)
 {
-    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
-        uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
-    }
-    /* Untagged: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    return xbox_HandleResolve(token);
 }
 
 static HANDLE bridge_take_handle(uint32_t token)
 {
-    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
-        uint32_t i = token & BRIDGE_HANDLE_MASK;
-        if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
-            s_handle_table[i] = NULL;
-            return h;
-        }
-    }
-    return NULL;   /* untagged -> not a table handle, do not close */
+    HANDLE h = xbox_HandleTake(token);
+    if (h) xbox_ThreadObjectHandleClosed(h);
+    return h;
 }
 
 /* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */
@@ -2961,7 +2940,7 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
-        fn();
+    xbox_GuestCall(fn);
         g_esp += 12;
     } else {
         uint32_t ord = 0;
@@ -3107,7 +3086,7 @@ static void bridge_RtlUnwind(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = exc_record;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* return address */
-                fn();
+    xbox_GuestCall(fn);
                 /* 16, not 20: the handler's own `ret` has already taken the
                  * return address off, leaving just the four arguments for the
                  * caller to drop. Cleaning 20 leaves esp four bytes high, and
@@ -3629,8 +3608,22 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
-    g_eax = 0;  /* STATUS_SUCCESS */
+    uint32_t object = 0;
+    /* Thread objects are directly inspected by XAPI GetExitCodeThread.
+     * Returning success with NULL made it poll page-zero SignalState forever.
+     * A type mismatch must fail rather than return a misleading thread view. */
+    if (!object_ptr) {
+        g_eax = 0xC000000Du;
+        return;
+    }
+    if (obj_type && obj_type !=
+            BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE)) {
+        BRIDGE_MEM32(object_ptr) = 0;
+        g_eax = 0xC0000024u; /* STATUS_OBJECT_TYPE_MISMATCH */
+        return;
+    }
+    g_eax = (uint32_t)xbox_ThreadObjectReference(bridge_resolve_handle(handle), &object);
+    BRIDGE_MEM32(object_ptr) = object;
 }
 
 /* ── RtlRaiseException (ordinal 302) ─────────────────────
@@ -3827,8 +3820,11 @@ static void bridge_KeCancelTimer(void)
 /* ── KeDisconnectInterrupt (ordinal 100, 1 arg) */
 static void bridge_KeDisconnectInterrupt(void)
 {
-    g_eax = (uint32_t)xbox_KeDisconnectInterrupt(
-        (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(STACK_ARG(0)));
+    uint32_t interrupt_va = STACK_ARG(0);
+    uint32_t vector = interrupt_va ? BRIDGE_MEM32(interrupt_va + 8) : XBOX_MAX_VECTORS;
+    g_eax = vector < XBOX_MAX_VECTORS && g_connected_isr[vector] == interrupt_va;
+    if (g_eax)
+        g_connected_isr[vector] = 0;
 }
 
 /* ── KeSetBasePriorityThread (ordinal 143, 2 args) */
@@ -3837,14 +3833,16 @@ static void bridge_KeDisconnectInterrupt(void)
  * missing, so the thunk fell through to the fallback and returned 0. */
 static void bridge_KeQueryBasePriorityThread(void)
 {
+    HANDLE thread = xbox_ThreadObjectHost(STACK_ARG(0));
     g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+        thread ? thread : XBOX_TO_NATIVE(STACK_ARG(0)));
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
+    HANDLE thread = xbox_ThreadObjectHost(STACK_ARG(0));
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+        thread ? thread : XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
@@ -3952,6 +3950,7 @@ static void bridge_NtResumeThread(void)
  * dereference whatever the caller happened to leave there. */
 static void bridge_ObfDereferenceObject(void)
 {
+    xbox_ThreadObjectDereference(g_ecx);
     xbox_ObfDereferenceObject(XBOX_TO_NATIVE(g_ecx));
     g_eax = 0;
 }
@@ -3970,6 +3969,7 @@ static void bridge_ObfDereferenceObject(void)
  * dereference whatever the caller happened to leave there. */
 static void bridge_ObfReferenceObject(void)
 {
+    xbox_ThreadObjectAddReference(g_ecx);
     xbox_ObfReferenceObject(XBOX_TO_NATIVE(g_ecx));
     g_eax = 0;
 }
@@ -4147,6 +4147,8 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
     uint32_t timeout_va = STACK_ARG(6);
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    XboxDispatcherWaitItem items[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    int has_guest = 0;
     uint32_t i;
 
     if (count == 0) {
@@ -4170,9 +4172,18 @@ static void bridge_KeWaitForMultipleObjects(void)
         calls++;
     }
 
-    for (i = 0; i < count; i++)
-        handles[i] = bridge_ke_object(
-            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+    for (i = 0; i < count; i++) {
+        uint32_t va = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        handles[i] = bridge_ke_object(va);
+        items[i].host = handles[i];
+        items[i].guest = bridge_guest_dispatcher(va);
+        if (items[i].guest) has_guest = 1;
+    }
+    if (has_guest) {
+        g_eax = (uint32_t)xbox_DispatcherWait(count, items, wait_type == 0,
+                    (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va));
+        return;
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
@@ -6529,10 +6540,9 @@ static void bridge_KdDebuggerNotPresent(void)
 /* ═══════════════════════════════════════════════════════════════════════════
  * Ke -- shadow-table object bridges (92-163)
  *
- * The KeInitialize* family creates a real Win32 object, records guest-VA ->
- * host-HANDLE in the shadow table, and zeroes/initialises the guest dispatcher
- * header. The KePulse/Release/Reset/Set family resolves back through the
- * shadow table (with XBOX_TO_NATIVE as a fallback for legacy callers).
+ * Events and semaphores use their guest dispatcher headers, so inline XDK
+ * initialization/reset remains authoritative. Mutants and legacy/Nt objects
+ * retain native shadow handles for host ownership and lifetime.
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
@@ -6543,16 +6553,7 @@ static void bridge_KeInitializeEvent(void)
     uint32_t event_type = STACK_ARG(1); /* 0=Notification(manual-reset), 1=Synchronization(auto-reset) */
     uint32_t initial_state = STACK_ARG(2);
 
-    BOOL manual_reset = (event_type == 0) ? TRUE : FALSE;
-    HANDLE h = CreateEventW(NULL, manual_reset, initial_state ? TRUE : FALSE, NULL);
-    if (!h) {
-        fprintf(stderr, "  [KERNEL] KeInitializeEvent: CreateEventW failed (error %u)\n",
-                GetLastError());
-        g_eax = 0;
-        return;
-    }
-
-    ke_shadow_insert(guest_va, h);
+    ke_shadow_remove(guest_va);
 
     /* Also zero the guest KEVENT struct (16 bytes) and set SignalState.
      * KEVENT layout: +0x00 Type(UCHAR), +0x01 Absolute(UCHAR),
@@ -6561,11 +6562,11 @@ static void bridge_KeInitializeEvent(void)
      *                +0x0C WaitListHead.Blink */
     BRIDGE_MEM8(guest_va + 0)  = (uint8_t)(event_type ? 1 : 0);
     BRIDGE_MEM8(guest_va + 1)  = 0;
-    BRIDGE_MEM8(guest_va + 2)  = 16;
-    BRIDGE_MEM8(guest_va + 3)  = 1;
+    BRIDGE_MEM8(guest_va + 2)  = 4;
+    BRIDGE_MEM8(guest_va + 3)  = 0;
     BRIDGE_MEM32(guest_va + 4) = initial_state ? 1 : 0; /* SignalState */
-    BRIDGE_MEM32(guest_va + 8) = 0;  /* WaitListHead.Flink (self/empty) */
-    BRIDGE_MEM32(guest_va + 12) = 0; /* WaitListHead.Blink (self/empty) */
+    BRIDGE_MEM32(guest_va + 8) = guest_va + 8;
+    BRIDGE_MEM32(guest_va + 12) = guest_va + 8;
 
     g_eax = 0;
 }
@@ -6607,23 +6608,16 @@ static void bridge_KeInitializeSemaphore(void)
     uint32_t count = STACK_ARG(1);
     uint32_t limit = STACK_ARG(2);
 
-    HANDLE h = CreateSemaphoreW(NULL, (LONG)count, (LONG)limit, NULL);
-    if (!h) {
-        fprintf(stderr, "  [KERNEL] KeInitializeSemaphore: CreateSemaphoreW failed (error %u)\n",
-                GetLastError());
-        g_eax = 0;
-        return;
-    }
+    ke_shadow_remove(guest_va);
 
-    ke_shadow_insert(guest_va, h);
-
-    BRIDGE_MEM8(guest_va + 0)  = 18;   /* DispatcherObjectType */
+    BRIDGE_MEM8(guest_va + 0)  = 5;    /* SemaphoreObject */
     BRIDGE_MEM8(guest_va + 1)  = 0;
-    BRIDGE_MEM8(guest_va + 2)  = 16;
-    BRIDGE_MEM8(guest_va + 3)  = 1;
+    BRIDGE_MEM8(guest_va + 2)  = 5;
+    BRIDGE_MEM8(guest_va + 3)  = 0;
     BRIDGE_MEM32(guest_va + 4) = (LONG)count; /* SignalState = count */
-    BRIDGE_MEM32(guest_va + 8) = 0;   /* WaitListHead */
-    BRIDGE_MEM32(guest_va + 12) = 0;
+    BRIDGE_MEM32(guest_va + 8) = guest_va + 8;
+    BRIDGE_MEM32(guest_va + 12) = guest_va + 8;
+    BRIDGE_MEM32(guest_va + 16) = limit;
 
     g_eax = 0;
 }
@@ -6635,9 +6629,15 @@ static void bridge_KePulseEvent(void)
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
     HANDLE h;
+    void *guest = bridge_guest_dispatcher(guest_va);
 
     (void)increment;
     (void)wait;
+
+    if (guest) {
+        g_eax = (uint32_t)xbox_DispatcherPulseEvent(guest);
+        return;
+    }
 
     h = ke_shadow_lookup(guest_va);
     if (!h)
@@ -6678,9 +6678,17 @@ static void bridge_KeReleaseSemaphore(void)
     uint32_t adjustment = STACK_ARG(2);  /* LONG */
     uint32_t wait = STACK_ARG(3);
     HANDLE h;
+    void *guest = bridge_guest_dispatcher(guest_va);
 
     (void)increment;
     (void)wait;
+
+    if (guest) {
+        LONG previous = 0;
+        xbox_DispatcherReleaseSemaphore(guest, (LONG)adjustment, &previous);
+        g_eax = (uint32_t)previous;
+        return;
+    }
 
     h = ke_shadow_lookup(guest_va);
     if (!h)
@@ -6696,6 +6704,12 @@ static void bridge_KeResetEvent(void)
 {
     uint32_t guest_va = STACK_ARG(0);
     HANDLE h;
+    void *guest = bridge_guest_dispatcher(guest_va);
+
+    if (guest) {
+        g_eax = (uint32_t)xbox_DispatcherResetEvent(guest);
+        return;
+    }
 
     h = ke_shadow_lookup(guest_va);
     if (!h)
@@ -6875,7 +6889,7 @@ static void bridge_KeLeaveCriticalRegion(void)
 /* --- KeRaiseIrqlToSynchLevel (ordinal 130, 0 args = 0 bytes) --- */
 static void bridge_KeRaiseIrqlToSynchLevel(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL; IRQL is not modelled */
+    g_eax = xbox_KfRaiseIrql(28); /* SYNCH_LEVEL; reference port */
 }
 
 /* --- KeRemoveByKeyDeviceQueue (ordinal 133, 2 args = 8 bytes) --- */
@@ -6979,7 +6993,7 @@ static void bridge_KiUnlockDispatcherDatabase(void)
  * report PASSIVE_LEVEL. */
 static void bridge_KeGetCurrentIrql(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL */
+    g_eax = xbox_CurrentIrql();
 }
 
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
@@ -7403,7 +7417,7 @@ static void bridge_PsCreateSystemThread(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+    xbox_GuestCall(fn);
                 g_esp += 12;
             } else {
                 const char *inline_workers = getenv("RECOMP_WORKERS");
@@ -8933,7 +8947,31 @@ static void kernel_watch_arm_once(void)
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+static void kernel_thunk_dispatch_body(void);
 static void kernel_thunk_dispatch(void)
+{
+    int slot = g_kernel_dispatch_slot;
+    ULONG ordinal = slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE ? g_slot_ordinals[slot] : 0;
+    /* Time queries and IRQL transitions do not block. Raised guest regions
+     * must retain the CPU throughout their kernel calls, just as an ISR does.
+     * A contended IRQL gate explicitly parks the CPU in kernel_irql.c. */
+    if (xbox_CurrentIrql() >= DISPATCH_LEVEL || ordinal == 103 || ordinal == 129
+            || ordinal == 130 || ordinal == 160 || ordinal == 161
+            || (ordinal >= 125 && ordinal <= 128)) {
+        kernel_thunk_dispatch_body();
+    } else {
+        /* Keep buffer accesses protected while the bridge parks the guest
+         * CPU. The actual host-wait paths release this memory lease only
+         * after copying their arguments, then reacquire before RAM access. */
+        xbox_MemoryEnter();
+        int depth = xbox_GuestSuspend();
+        kernel_thunk_dispatch_body();
+        xbox_GuestResume(depth);
+        xbox_MemoryLeave();
+    }
+}
+
+static void kernel_thunk_dispatch_body(void)
 {
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
@@ -9041,6 +9079,11 @@ static void kernel_thunk_dispatch(void)
 
     if (bridge) {
         bridge();
+        /* The OS may wake this host thread before a signalling ISR/DPC has
+         * returned. Keep the guest wait boundary below raised-IRQL work. */
+        if (ordinal == 158 || ordinal == 159 || ordinal == 233
+                || ordinal == 234 || ordinal == 235)
+            xbox_GuestWaitResume();
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than
          * gating on g_kernel_call_count: a missing bridge is rare and is

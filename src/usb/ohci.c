@@ -9,7 +9,9 @@
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
+#include "../kernel/kernel.h"
 #include "usb_gamepad.h"
+#include "platform/guest_memory.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,9 +47,8 @@ extern OHCI_TLS uint32_t g_ebx, g_esi, g_edi;
 extern OHCI_TLS uint32_t g_fs_base;
 extern uint32_t xbox_AllocThreadTib(void);
 
-/* The vector XPP takes for USB0. HalGetInterruptVector(1) returns 1 here, and
- * the bus interrupt level is what the XDK passes. */
-#define OHCI_VECTOR  1
+/* USB0 is PIC IRQ1, mapped by HalGetInterruptVector to vector 0x31. */
+#define OHCI_VECTOR  0x31
 
 /* ---- OHCI 1.0a operational registers, by byte offset ------------------- */
 #define HcRevision              0x00
@@ -116,18 +117,20 @@ static void wr32(uint32_t va, uint32_t v);
 
 /* The MCPX gives each controller a small root hub. Two ports apiece covers
  * the console's four front sockets, which is what a title enumerates over. */
-#define OHCI_PORTS              2
+#define OHCI_PORTS              4
 
 typedef struct {
     uint32_t base;                      /* Xbox VA of the register block   */
     uint32_t reg[OHCI_REG_MAX / 4];
     unsigned reads, writes, decode_fail;
+    volatile LONG ack_seq;             /* status acknowledgments across ISR/DPC */
     int      index;
 } OhciController;
 
 static OhciController s_hc[2];
 static int s_enabled;
 static int s_trace;
+#define OHCI_TICK_MS 4u
 
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
@@ -145,14 +148,9 @@ static uint64_t ohci_read(void *dev, uint32_t off, int size)
 
     hc->reads++;
 
-    /* HcFmRemaining and HcFmNumber advance on their own. A driver that waits
-     * for the frame counter to move is waiting for the controller to be
-     * running, and a counter that never changes is a controller that is not.
-     * Derived from the read count rather than a timer: it only has to be
-     * monotonic, and a timer here would need a thread to be worth having. */
-    if (aligned == HcFmNumber)
-        v = (hc->reads >> 3) & 0xFFFFu;
-    else if (aligned == HcFmRemaining)
+    /* HcFmNumber is the same controller clock published in HCCA. Deriving
+     * it from MMIO reads gives the cancellation driver two unrelated times. */
+    if (aligned == HcFmRemaining)
         v = (hc->reads * 977u) & 0x3FFFu;
 
     /* Sub-dword reads take their slice of the containing register. */
@@ -222,9 +220,11 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             uint32_t hcca = hc->reg[HcHCCA / 4];
             if (hcca)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
-            hc->reg[HcDoneHead / 4] = 0;
+            /* HcDoneHead may hold later completions. Only the published
+             * HCCA list belongs to this acknowledgment. */
         }
         *r &= ~v;                       /* write 1 to clear                 */
+        InterlockedIncrement(&hc->ack_seq);
         return;
 
     case HcInterruptEnable:
@@ -246,7 +246,9 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
         return;
 
     case HcRhPortStatus1:
-    case HcRhPortStatus1 + 4: {
+    case HcRhPortStatus1 + 4:
+    case HcRhPortStatus1 + 8:
+    case HcRhPortStatus1 + 12: {
         /* Writes here are set/clear requests by bit position, not a value to
          * store. Getting that wrong looks like a port that will not enable. */
         unsigned port = (aligned - HcRhPortStatus1) / 4;
@@ -391,20 +393,43 @@ static int guest_ok(uint32_t va, uint32_t bytes)
     return (uint64_t)va + bytes <= (uint64_t)mapped;
 }
 
-static uint32_t rd32(uint32_t va)
+/* OHCI list registers and descriptor links contain DMA bus addresses. The
+ * contiguous window has separate backing from low RAM in this runtime, so a
+ * physical offset cannot be dereferenced as a VA. Otherwise HCCA/ED reads
+ * see zeroes and completion writes never reach the driver's queue. Use the
+ * same arena test as the pushbuffer executor; preserve pass-through VAs and
+ * addresses which already name the window. The reserved first page also
+ * contains XAPI's report buffers, despite not being an ordinary allocation. */
+static uint32_t bus_to_va(uint32_t bus)
 {
+    /* MmGetPhysicalAddress passes non-contiguous VAs through unchanged.
+     * XAPI uses a static image buffer for GET_DESCRIPTOR replies as well as
+     * contiguous EDs/TDs. Redirecting that buffer loses the reply and causes
+     * three enumeration retries followed by a disabled port. */
+    if (bus >= g_xbox_image_lo && bus < g_xbox_image_hi)
+        return bus;
+    if (bus && bus < xbox_ContiguousAllocatedBytes())
+        return OHCI_CONTIG_BASE + bus;
+    return bus;
+}
+
+static uint32_t rd32(uint32_t bus)
+{
+    uint32_t va = bus_to_va(bus);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
-static void wr32(uint32_t va, uint32_t v)
+static void wr32(uint32_t bus, uint32_t v)
 {
+    uint32_t va = bus_to_va(bus);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
-static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
+static uint8_t *guest_ptr(uint32_t bus, uint32_t bytes)
 {
+    uint32_t va = bus_to_va(bus);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
@@ -561,15 +586,51 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
     return completed;
 }
 
-/* Publish the done queue where the driver reads it and say so. */
-static void ohci_publish_done(OhciController *hc, uint32_t done_head)
+/* The driver owns HccaDoneHead while WDH is set. Retired descriptors must
+ * remain in HcDoneHead until that list has been acknowledged; replacing the
+ * published head loses completions or makes the driver reuse retired TDs. */
+static void ohci_flush_done(OhciController *hc)
 {
     uint32_t hcca = hc->reg[HcHCCA / 4];
+    uint32_t held = hc->reg[HcDoneHead / 4];
 
+    if (!held || (hc->reg[HcInterruptStatus / 4] & INTR_WDH))
+        return;
     if (hcca)
-        wr32(hcca + HCCA_DONE_HEAD, done_head);
-    hc->reg[HcDoneHead / 4] = done_head;
+        wr32(hcca + HCCA_DONE_HEAD, held);
+    hc->reg[HcDoneHead / 4] = 0;
     hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+}
+
+/* OHCI orders completed TDs newest first, including batches held while the
+ * driver is still consuming the previous published list. */
+static void ohci_publish_done(OhciController *hc, uint32_t done_head)
+{
+    uint32_t held = hc->reg[HcDoneHead / 4];
+
+    if (!done_head)
+        return;
+    if (held) {
+        uint32_t t = done_head, guard = 0, next;
+        while (t && ++guard < 256 && (next = rd32(t + 8) & ED_PTR_MASK) != 0)
+            t = next;
+        if (t)
+            wr32(t + 8, held);
+    }
+    hc->reg[HcDoneHead / 4] = done_head;
+    ohci_flush_done(hc);
+}
+
+static void ohci_advance_frame(OhciController *hc, uint32_t elapsed_ms)
+{
+    uint32_t old = hc->reg[HcFmNumber / 4];
+    uint32_t hcca = hc->reg[HcHCCA / 4];
+    if (!elapsed_ms) return;
+    hc->reg[HcFmNumber / 4] = (old + elapsed_ms) & 0xFFFFu;
+    if ((old & 0x7FFFu) + (uint64_t)elapsed_ms >= 0x8000u)
+        hc->reg[HcInterruptStatus / 4] |= INTR_FNO;
+    if (hcca) wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
+    hc->reg[HcInterruptStatus / 4] |= INTR_SF;
 }
 
 static int ohci_run_control_list(OhciController *hc)
@@ -630,13 +691,14 @@ static int ohci_run_periodic_list(OhciController *hc)
  * Returns what the routine returned: an ISR that does not claim the interrupt
  * returns FALSE, and that is worth seeing rather than assuming.
  */
-static int ohci_call_isr(OhciController *hc)
+static int ohci_call_isr_body(OhciController *hc)
 {
     uint32_t kinterrupt = xbox_GetConnectedInterrupt(OHCI_VECTOR);
     uint32_t routine, context;
     recomp_func_t fn;
     uint8_t *mem;
     int slot;
+    KIRQL old_irql;
 
     if (!kinterrupt)
         return -1;                      /* nothing connected yet            */
@@ -672,10 +734,21 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    fn();
+    old_irql = xbox_KfRaiseIrql(*(uint8_t *)(mem + kinterrupt + 12));
+    xbox_GuestCall(fn);
+    xbox_KfLowerIrql(old_irql);
 
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);
+}
+
+static int ohci_call_isr(OhciController *hc)
+{
+    int claimed;
+    xbox_MemoryEnter();
+    claimed=ohci_call_isr_body(hc);
+    xbox_MemoryLeave();
+    return claimed;
 }
 
 /* Set the status bits and, if the driver has unmasked them, call the ISR.
@@ -741,8 +814,8 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
      * A console detects the port change after the controller is running, so
      * that is what the controller thread does: it waits for operational with
      * the interrupt unmasked, and only then plugs the device in. */
-    hc->reg[HcRhPortStatus1 / 4]       = PORT_PPS;
-    hc->reg[(HcRhPortStatus1 + 4) / 4] = PORT_PPS;
+    for (unsigned port = 0; port < OHCI_PORTS; port++)
+        hc->reg[(HcRhPortStatus1 + port * 4) / 4] = PORT_PPS;
 }
 
 /* The controller, running on its own thread.
@@ -754,12 +827,9 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  * hardware does -- an interrupt arrives when the controller decides, not when
  * the driver next reads a register.
  *
- * ponytail: one delivery, of the root hub status change that is already
- * pending from bring-up. There is nothing behind it yet -- no descriptor list
- * walking, so an enumeration attempt has nothing to answer it -- and the point
- * of this delivery is to find out what the driver does when it finally gets
- * the interrupt it has been waiting for. Repeat delivery and the transfer
- * lists come after that answer, not before it.
+ * Each tick advances the frame clock, services enabled endpoint lists and
+ * delivers pending enabled interrupt sources. WDH ownership holds later work
+ * until the driver acknowledges the previous list.
  */
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
@@ -774,7 +844,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     unsigned waited = 0;
     int plugged = 0;
     uint32_t last_status = 0;
+    LONG last_ack = 0;
     unsigned repeats = 0;
+    ULONGLONG last_tick = GetTickCount64();
 
     (void)unused;
     {
@@ -791,21 +863,22 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     for (;;) {
         OhciController *hc = &s_hc[0];
         uint32_t control, enable, status;
+        ULONGLONG now, elapsed;
 
-        Sleep(20);
+        Sleep(OHCI_TICK_MS);
+        now = GetTickCount64();
+        elapsed = now - last_tick;
+        last_tick = now;
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
+            if (++waited > 30000u / OHCI_TICK_MS)
                 break;
             continue;
         }
-        if (!(enable & INTR_MIE))
-            continue;
-
         /* Plug the device in once, after the driver is running and listening.
          * Presenting it earlier does not work: the driver clears the connect
          * change during its own bring-up scan, and a reset clears interrupt
@@ -814,43 +887,17 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (!plugged && (enable & INTR_RHSC)) {
             /* Which port the device appears on decides which controller slot
              * XAPI assigns it, and a title that reads "player 1" looks at slot
-             * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
-             * mapping can be found by measurement rather than assumed. */
+             * 0. The Xbox maps players 1/2/3/4 to root ports 3/4/1/2;
+             * RECOMP_USB_PORT selects a zero-based root port (0..3). */
             const char *pspec = getenv("RECOMP_USB_PORT");
             unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
-            if (port > 1u) port = 1u;
+            if (port >= OHCI_PORTS) port = OHCI_PORTS - 1;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
+                            "arriving on port %u\n", waited * OHCI_TICK_MS, port + 1);
             fflush(stderr);
-        }
-
-        /* The frame clock.
-         *
-         * INTR_SF was defined and never raised, and HcFmNumber only moved when
-         * something read it. That is enough for a driver that polls, and not
-         * enough for one that waits: USB enumeration is full of delays counted
-         * in frames -- the recovery time after SET_ADDRESS is the first -- and
-         * the Xbox stack enables StartOfFrame precisely to count them. Without
-         * a frame ever starting, enumeration stops one transfer past
-         * SET_ADDRESS with the driver waiting for time to pass.
-         *
-         * Twenty frames a tick because a frame is 1 ms and this loop sleeps
-         * 20. The count is what drivers compare; the rate is what they feel,
-         * and both are closer to right this way than a counter that never
-         * moves. */
-        {
-            uint32_t hcca = hc->reg[HcHCCA / 4];
-
-            hc->reg[HcFmNumber / 4] =
-                (hc->reg[HcFmNumber / 4] + 20u) & 0xFFFFu;
-            /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
-             * controller zeroes, so a dword write is what hardware does. */
-            if (hcca)
-                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
         }
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
@@ -858,6 +905,13 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * on it. Walking on the tick rather than only when CLF is written
          * costs a read of a guest dword and means a descriptor queued without
          * rewriting CLF is still moved -- which is legal, and drivers do it. */
+        /* Leave queued TDs on their endpoints until the driver has consumed
+         * the published list. This also avoids reusing descriptors while
+         * the interrupt handler is still walking them. */
+        xbox_MemoryEnter();
+        if (hc->reg[HcInterruptStatus / 4] & INTR_WDH)
+            goto deliver;
+
         /* PeriodicListEnable, bit 2 of HcControl. */
         if (control & 0x04u)
             ohci_run_periodic_list(hc);
@@ -885,23 +939,37 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * set, the line is asserted. The handler clears the status bit, so
          * this stops on its own -- and if it ever does not, the cap below says
          * so rather than spinning the ISR forever. */
+        ohci_flush_done(hc);
+    deliver:
+        /* Finish this batch's DMA before publishing a later frame. Cancellation
+         * uses frame deadlines to retire skipped EDs/TDs. MIE masks only the
+         * interrupt line; the bus and frame clock continue while it is clear.
+         * Count elapsed milliseconds, including host scheduling delays. */
+        ohci_advance_frame(hc, elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed);
+        xbox_MemoryLeave();
+        enable = hc->reg[HcInterruptEnable / 4];
+        if (!(enable & INTR_MIE)) continue;
         status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
         if (!status)
             continue;
 
-        /* A stuck source is one the handler never clears, which shows up as
-         * the same status delivered over and over. Counting deliveries alone
-         * would trip on a device that is simply busy. */
-        if (status == last_status) {
-            if (++repeats > 200) {
-                fprintf(stderr, "  [OHCI0] status %08X delivered 200 times "
-                                "without being cleared; stopping\n", status);
-                fflush(stderr);
-                break;
+        /* A busy pad raises WDH for every report. The same status value does
+         * not mean the driver failed to clear it between frames; count only
+         * deliveries with no intervening status acknowledgment. */
+        {
+            LONG ack = InterlockedCompareExchange(&hc->ack_seq, 0, 0);
+            if (status == last_status && ack == last_ack) {
+                if (++repeats > 200) {
+                    fprintf(stderr, "  [OHCI0] status %08X delivered 200 times "
+                                    "with no acknowledgement; stopping\n", status);
+                    fflush(stderr);
+                    break;
+                }
+            } else {
+                last_status = status;
+                last_ack = ack;
+                repeats = 0;
             }
-        } else {
-            last_status = status;
-            repeats = 0;
         }
         ohci_raise(hc, status);
     }
@@ -1022,10 +1090,13 @@ void xbox_OhciReport(void)
         return;
     for (i = 0; i < 2; i++)
         fprintf(stderr, "  [OHCI%d] %u reads, %u writes, %u undecoded; "
-                        "HcControl=%08X HcIntStatus=%08X port1=%08X\n",
+                        "HcControl=%08X HcIntStatus=%08X ports=%08X/%08X/%08X/%08X\n",
                 i, s_hc[i].reads, s_hc[i].writes, s_hc[i].decode_fail,
                 s_hc[i].reg[HcControl / 4],
                 s_hc[i].reg[HcInterruptStatus / 4],
-                s_hc[i].reg[HcRhPortStatus1 / 4]);
+                s_hc[i].reg[HcRhPortStatus1 / 4],
+                s_hc[i].reg[(HcRhPortStatus1 + 4) / 4],
+                s_hc[i].reg[(HcRhPortStatus1 + 8) / 4],
+                s_hc[i].reg[(HcRhPortStatus1 + 12) / 4]);
     fflush(stderr);
 }

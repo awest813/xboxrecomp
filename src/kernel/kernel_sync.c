@@ -15,6 +15,7 @@
  */
 
 #include "kernel.h"
+#include "platform/guest_memory.h"
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -200,7 +201,9 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     PLARGE_INTEGER Timeout)
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    int memory=xbox_MemorySuspend();
     DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    xbox_MemoryResume(memory);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -220,7 +223,11 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
-    result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    {
+        int memory=xbox_MemorySuspend();
+        result = WaitForSingleObjectEx(Handle, ms, Alertable);
+        xbox_MemoryResume(memory);
+    }
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -238,7 +245,17 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
-    result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+    {
+        HANDLE hosts[MAXIMUM_WAIT_OBJECTS];ULONG i;
+        int memory;
+        if(Count && Count<=MAXIMUM_WAIT_OBJECTS) {
+            for(i=0;i<Count;i++)hosts[i]=Handles[i];
+            Handles=hosts;
+        }
+        memory=xbox_MemorySuspend();
+        result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+        xbox_MemoryResume(memory);
+    }
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -259,7 +276,9 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    int memory=xbox_MemorySuspend();
     DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    xbox_MemoryResume(memory);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -281,8 +300,15 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
 
     /* Objects[] is an array of PVOID which we treat as HANDLE[] */
-    DWORD result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,
-                                            bWaitAll, ms, Alertable);
+    HANDLE hosts[MAXIMUM_WAIT_OBJECTS];ULONG i;
+    DWORD result;int memory;
+    if(Count && Count<=MAXIMUM_WAIT_OBJECTS) {
+        for(i=0;i<Count;i++)hosts[i]=(HANDLE)Objects[i];
+        Objects=(PVOID*)hosts;
+    }
+    memory=xbox_MemorySuspend();
+    result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,bWaitAll,ms,Alertable);
+    xbox_MemoryResume(memory);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 

@@ -1,6 +1,19 @@
 # xbox_input — Xbox Gamepad to XInput
 
+Acceptance-test automation can opt into `RECOMP_TEST_KEY_HOLD_MS=2500` to
+retain short injected taps through slow guest polling. It is disabled by
+default; valid durations are 0–10000 ms. Releases expire on polling, while
+focus loss cancels them immediately. This is a test aid, not an FPS fix.
+
 Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGetState` with a slightly different structure layout than the XInput API on Windows. This layer translates between them.
+
+On Windows, `RECOMP_KEYBOARD=1` also supplies a controller on port 0 from
+the framebuffer window. It merges with a physical controller. The window
+must have focus; losing focus releases held keys. Enter is Start, Backspace
+is Back, arrows are the d-pad, Z/X/A/S are A/B/X/Y, Q/E are White/Black,
+1/3 are the triggers, numpad 4/6/2/8 controls the left stick, and J/L/K/I
+controls the right stick. Shift/Ctrl click the left/right stick. Keyboard
+input is disabled by default.
 
 ## Files
 
@@ -135,3 +148,9 @@ XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 ```
 
 The Xbox supports 4 controllers. Each port can have a controller with optional memory units and other accessories. This layer only handles the gamepad; memory unit emulation is not needed for recompiled games.
+
+When input is delivered through the guest's OHCI/XAPI stack, the physical
+root-port order differs from player order: players 1/2/3/4 use root ports
+3/4/1/2. `RECOMP_USB_PORT` selects a zero-based root port (0..3); set it to
+`2` for player 1. The title launcher can supply that default while preserving
+an explicit environment override. This does not change the host XInput index.

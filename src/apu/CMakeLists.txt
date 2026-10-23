@@ -14,6 +14,7 @@ add_library(xbox_apu STATIC
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(xbox_apu PRIVATE xbox_guest_memory)
 
 # qemu_shim.h lives in nv2a/ - shared QEMU type abstraction
 target_include_directories(xbox_apu PRIVATE
@@ -34,6 +35,12 @@ if(MSVC)
 endif()
 
 if(WIN32)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/apu_dma_smoke
+                     ${CMAKE_CURRENT_BINARY_DIR}/apu_dma_smoke)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/apu_output_smoke
+                     ${CMAKE_CURRENT_BINARY_DIR}/apu_output_smoke)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xaudio2_queue_smoke
+                     ${CMAKE_CURRENT_BINARY_DIR}/xaudio2_queue_smoke)
     # xaudio2_8 for XAudio2Create, which apu_xaudio2.c calls directly.
     # It was missing: nothing had ever referenced this library from a linked
     # target, so the archive was built and never pulled in, and the first

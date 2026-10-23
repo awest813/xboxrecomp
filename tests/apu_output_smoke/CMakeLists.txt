@@ -1,0 +1,3 @@
+add_executable(apu_output_smoke main.c)
+target_link_libraries(apu_output_smoke PRIVATE xbox_apu platform)
+target_compile_definitions(apu_output_smoke PRIVATE _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)

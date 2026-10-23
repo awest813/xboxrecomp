@@ -14,6 +14,8 @@
 #include "usb_gamepad.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -130,6 +132,21 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         }
     }
 
+    /* XAPI also reads the input report over the control pipe. A stall here
+     * halts endpoint zero during pad initialization, even when interrupt
+     * reports work. Answer with the same report as the interrupt endpoint. */
+    if (type == 1 && setup->bRequest == 0x01 && is_in) {
+        uint8_t report[20];
+        int n = usb_gamepad_report(report, (int)sizeof report);
+        if (n <= 0)
+            return -1;
+        return copy_out(out, max, report, n, setup->wLength);
+    }
+    /* SET_REPORT carries rumble in its OUT data stage. The controller model
+     * currently discards that stage; its status stage must still succeed. */
+    if (type == 1 && setup->bRequest == 0x09 && !is_in)
+        return 0;
+
     /* Vendor requests on the interface -- the XID protocol.
      *
      * This is how XAPI tells a controller from any other USB device. The
@@ -217,7 +234,7 @@ int usb_gamepad_report(uint8_t *out, int max)
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
     if (xbox_InputGetState(0, &state) != 0)
-        return 20;
+        memset(&state, 0, sizeof(state));
 
     g = &state.Gamepad;
     out[2] = (uint8_t)(g->wButtons & 0xFF);
@@ -232,5 +249,20 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    /* Trace state edges rather than every interrupt transfer. This distinguishes
+     * a working host key/pad from a guest that never submits report reads. */
+    if (getenv("RECOMP_INPUT_TRACE")) {
+        static uint8_t previous[20];
+        static int seen;
+        if (!seen || memcmp(previous, out, 20)) {
+            fprintf(stderr, "  [PAD] report buttons=%04X A=%u B=%u X=%u Y=%u"
+                            " sticks=%d,%d %d,%d\n", g->wButtons,
+                    g->bAnalogButtons[0], g->bAnalogButtons[1],
+                    g->bAnalogButtons[2], g->bAnalogButtons[3],
+                    g->sThumbLX, g->sThumbLY, g->sThumbRX, g->sThumbRY);
+            memcpy(previous, out, 20);
+            seen = 1;
+        }
+    }
     return 20;
 }

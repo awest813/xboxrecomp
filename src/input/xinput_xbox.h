@@ -88,6 +88,12 @@ typedef struct XBOX_INPUT_CAPABILITIES {
  */
 void xbox_InputInit(void);
 
+#if defined(_WIN32)
+/* Feed key messages from the host window. Clear held keys on focus loss. */
+void xbox_InputSetKeyState(unsigned key, int down);
+void xbox_InputClearKeys(void);
+#endif
+
 /**
  * Get the state of a controller.
  * Port: 0-3 (Xbox controller ports)
