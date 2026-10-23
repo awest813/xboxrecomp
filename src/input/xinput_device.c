@@ -11,6 +11,8 @@
  */
 
 #include "xinput_xbox.h"
+#include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ======================================================================== */
@@ -23,6 +25,79 @@
 
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+
+/* Optional keyboard controller, following the NFSU2 reference port's mapping.
+ * The host window feeds its own key messages here, so typing elsewhere does
+ * not operate the game. Keep this state in input rather than making the input
+ * library depend on a particular window/presentation implementation. */
+static SRWLOCK s_keyboard_lock = SRWLOCK_INIT;
+static BYTE s_keys[256];
+static DWORD s_key_packet;
+
+void xbox_InputSetKeyState(unsigned key, int down)
+{
+    int changed = 0;
+    if (key >= 256)
+        return;
+    AcquireSRWLockExclusive(&s_keyboard_lock);
+    if (s_keys[key] != !!down) {
+        s_keys[key] = (BYTE)!!down;
+        s_key_packet++;
+        changed = 1;
+    }
+    ReleaseSRWLockExclusive(&s_keyboard_lock);
+    if (changed && getenv("RECOMP_INPUT_TRACE"))
+        fprintf(stderr, "  [KEYBOARD] key=%02X %s\n", key, down ? "down" : "up");
+}
+
+void xbox_InputClearKeys(void)
+{
+    unsigned i;
+    AcquireSRWLockExclusive(&s_keyboard_lock);
+    for (i = 0; i < 256; i++) {
+        if (s_keys[i]) {
+            memset(s_keys, 0, sizeof(s_keys));
+            s_key_packet++;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_keyboard_lock);
+}
+
+static BOOL keyboard_enabled(void)
+{
+    const char *v = getenv("RECOMP_KEYBOARD");
+    return v && *v && *v != '0';
+}
+
+static SHORT keyboard_axis(unsigned negative, unsigned positive)
+{
+    return (SHORT)((s_keys[positive] - s_keys[negative]) * 32767);
+}
+
+static void keyboard_state(XBOX_INPUT_STATE *state)
+{
+    static const unsigned analog_keys[8] = { 'Z', 'X', 'A', 'S', 'E', 'Q', '1', '3' };
+    unsigned i;
+    memset(state, 0, sizeof(*state));
+    AcquireSRWLockShared(&s_keyboard_lock);
+    state->dwPacketNumber = s_key_packet;
+    if (s_keys[VK_UP])      state->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_UP;
+    if (s_keys[VK_DOWN])    state->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (s_keys[VK_LEFT])    state->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (s_keys[VK_RIGHT])   state->Gamepad.wButtons |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if (s_keys[VK_RETURN])  state->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+    if (s_keys[VK_BACK])    state->Gamepad.wButtons |= XBOX_GAMEPAD_BACK;
+    if (s_keys[VK_SHIFT])   state->Gamepad.wButtons |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (s_keys[VK_CONTROL]) state->Gamepad.wButtons |= XBOX_GAMEPAD_RIGHT_THUMB;
+    for (i = 0; i < 8; i++)
+        state->Gamepad.bAnalogButtons[i] = s_keys[analog_keys[i]] ? 255 : 0;
+    state->Gamepad.sThumbLX = keyboard_axis(VK_NUMPAD4, VK_NUMPAD6);
+    state->Gamepad.sThumbLY = keyboard_axis(VK_NUMPAD2, VK_NUMPAD8);
+    state->Gamepad.sThumbRX = keyboard_axis('J', 'L');
+    state->Gamepad.sThumbRY = keyboard_axis('K', 'I');
+    ReleaseSRWLockShared(&s_keyboard_lock);
+}
 
 void xbox_InputInit(void)
 {
@@ -44,6 +119,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
+        if (dwPort == 0 && keyboard_enabled()) {
+            keyboard_state(pState);
+            return ERROR_SUCCESS;
+        }
         return result;
     }
 
@@ -74,6 +153,23 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
 
+    /* Merge with a real controller as well. Both sources' packet counters
+     * contribute, so an unchanged keyboard cannot hide a physical pad edge. */
+    if (dwPort == 0 && keyboard_enabled()) {
+        XBOX_INPUT_STATE kb;
+        unsigned i;
+        keyboard_state(&kb);
+        pState->dwPacketNumber += kb.dwPacketNumber;
+        pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+        for (i = 0; i < 8; i++)
+            if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+                pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+        if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+        if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+        if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+        if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+    }
+
     return ERROR_SUCCESS;
 }
 
@@ -86,12 +182,17 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    {
+        DWORD result = XInputSetState(dwPort, &xi_vib);
+        return result == ERROR_DEVICE_NOT_CONNECTED && dwPort == 0 && keyboard_enabled()
+             ? ERROR_SUCCESS : result;
+    }
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    if (dwPort == 0 && keyboard_enabled()) return TRUE;
     return g_controller_connected[dwPort];
 }
 
@@ -104,7 +205,18 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
         return ERROR_DEVICE_NOT_CONNECTED;
 
     result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
-    if (result != ERROR_SUCCESS) return result;
+    if (result != ERROR_SUCCESS) {
+        if (dwPort != 0 || !keyboard_enabled())
+            return result;
+        memset(pCaps, 0, sizeof(*pCaps));
+        pCaps->Type = 1;
+        pCaps->SubType = 1;
+        pCaps->Gamepad.wButtons = 0x00FF;
+        memset(pCaps->Gamepad.bAnalogButtons, 255, 8);
+        pCaps->Gamepad.sThumbLX = pCaps->Gamepad.sThumbLY = 32767;
+        pCaps->Gamepad.sThumbRX = pCaps->Gamepad.sThumbRY = 32767;
+        return ERROR_SUCCESS;
+    }
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
     pCaps->Type = xi_caps.Type;

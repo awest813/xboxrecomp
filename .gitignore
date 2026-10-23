@@ -44,6 +44,7 @@ mvp06/build/
 mvp06/src/recomp/gen/
 mvp06/run*
 mvp06/*.txt
+!mvp06/CMakeLists.txt
 !mvp06/AGENTS.md
 reference/
 mvp06/*.log

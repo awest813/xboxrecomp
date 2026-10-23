@@ -20,6 +20,11 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include "kernel.h"
+#include "nv2a_trap.h"
+#include "nv2a_ack.h"
+#include "platform/guest_memory.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -51,10 +56,105 @@ typedef void (*recomp_func_t)(void);
 #else
 #define MVP06_TLS _Thread_local
 #endif
-extern MVP06_TLS uint32_t g_eax, g_esp;
+extern MVP06_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp;
 extern ptrdiff_t g_xbox_mem_offset;
 #define MVP06_MEM32(va) \
     (*(uint32_t *)(void *)((uintptr_t)(va) + (size_t)g_xbox_mem_offset))
+
+/* The original XDK handler is also called directly by D3D busy-waits. Keep
+ * its complete call under the same lock as trap publication, and retire W1C
+ * status on this thread before the DPC can loop. As in NFSU2, DISPATCH_LEVEL
+ * also excludes the other D3D handler. Rename only the generated definition
+ * to _gen so direct calls and the dispatch table both reach this wrapper. */
+extern void sub_005810D0_gen(void);
+extern void sub_0057D710_gen(void);
+/* BlockOnTime checks GET, then retrofits NOP(5) into commands >=8 KB ahead.
+ * Retain a RAM reader across lifted preemption so an exclusive GPU slice
+ * cannot force the CPU to stop while it consumes those patch slots (a 4096-
+ * word slice advances 16 KB). Real host waits still drop every RAM reference.
+ * The synchronous GPU path remains free to run while this thread executes. */
+extern void xbox_MemoryCall(void (*fn)(void));
+void sub_0057D710(void)
+{
+    uint32_t dev=MVP06_MEM32(0x589A38);
+    if(dev) {
+        xbox_MemoryTraceWatch((uintptr_t)&MVP06_MEM32(dev+0x1DCC));
+        xbox_MemoryTrace(XBOX_TRACE_CALL,MVP06_MEM32(g_esp+4),MVP06_MEM32(g_esp+8),
+            MVP06_MEM32(MVP06_MEM32(dev+0x30)),MVP06_MEM32(0xFD800044));
+    }
+    xbox_MemoryCall(sub_0057D710_gen);
+}
+/* Observational hooks preserve the original inline stores. They are declared
+ * in tools_patch_d3d.py and checked against a fresh mechanical lift. */
+void mvp06_d3d_wait_clear(uint32_t dev,uint32_t patch,uint32_t value)
+{
+    uint32_t old=MVP06_MEM32(dev+0x1DD0);
+    MVP06_MEM32(dev+0x1DD0)=value;
+    xbox_MemoryTrace(XBOX_TRACE_CLEAR,(uintptr_t)&MVP06_MEM32(dev+0x1DCC),patch,old,
+        ((uint64_t)MVP06_MEM32(0xFD800044)<<32)|MVP06_MEM32(0xFD800040));
+}
+void mvp06_d3d_wait_publish(uint32_t patch)
+{
+    MVP06_MEM32(patch+0x1C)=5;
+    xbox_MemoryTrace(XBOX_TRACE_PUBLISH,patch+0x1C,5,0,
+        ((uint64_t)MVP06_MEM32(0xFD800044)<<32)|MVP06_MEM32(0xFD800040));
+}
+void mvp06_d3d_wait_get(uint32_t dev,uint32_t returned,uint32_t flags)
+{
+    xbox_MemoryTrace(XBOX_TRACE_GET,returned,flags,
+        ((uint64_t)MVP06_MEM32(0xFD800044)<<32)|MVP06_MEM32(0xFD800040),
+        ((uint64_t)MVP06_MEM32(MVP06_MEM32(dev+0x30))<<32)|MVP06_MEM32(0xFD400B10));
+}
+extern void sub_00580B60_gen(void);
+void sub_00580B60(void)
+{
+    uint8_t old=xbox_CurrentIrql();
+    if(old<2)xbox_KfRaiseIrql(2);
+    sub_00580B60_gen();
+    if(old<2)xbox_KfLowerIrql(old);
+}
+
+void sub_005810D0(void)
+{
+    uint8_t old=xbox_CurrentIrql();
+    volatile void *nv=(volatile void *)((size_t)g_xbox_mem_offset+0xFD000000u);
+    uint32_t source;
+    if(old<2)xbox_KfRaiseIrql(2);
+    nv2a_trap_handler_lock();
+    source=*(volatile uint32_t *)((volatile uint8_t *)nv+0x400108);
+    sub_005810D0_gen();
+    if(source)nv2a_trap_handler_taken(nv);
+    nv2a_trap_handler_unlock();
+    if(old<2)xbox_KfLowerIrql(old);
+}
+
+/* Service the original driver's three PCRTC_INTR_0 stores as W1C MMIO.
+ * This includes its masked-vblank branch, which acknowledges without calling
+ * the normal vblank handler. No grace timeout or synthetic counter update. */
+void mvp06_nv2a_vblank_ack(uint32_t base,uint32_t value)
+{
+    nv2a_ack_vblank_write((volatile void *)((size_t)g_xbox_mem_offset+base),value);
+}
+
+/* Temporary opt-in endpoint-retirement diagnostics. Direct generated calls
+ * require local hooks in chunk37; a complete lift removes those hooks. */
+void mvp06_usb_cancel_trace(uint32_t site, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    static int enabled = -1;
+    static unsigned count;
+    unsigned i;
+    uint32_t p = site == 0x5E9D2B ? d : c;
+    if (enabled < 0) enabled = getenv("RECOMP_USB_CANCEL_TRACE") != NULL;
+    if (!enabled || count++ >= 128) return;
+    fprintf(stderr, "[USBCANCEL] site=%08X a=%08X b=%08X c=%08X d=%08X ep:", site,a,b,c,d);
+    if ((p >= 0x80000000u && p < 0x83FFFFD0u) || (p >= 0x10000u && p < 0x3FFFFD0u))
+        for (i=0; i<10; i++) fprintf(stderr," %08X",MVP06_MEM32(p+i*4));
+    if (site == 0x5E9D95 && d >= 0x80000000u && d < 0x83FFFFE0u) {
+        fputs(" td:",stderr);
+        for (i=0; i<8; i++) fprintf(stderr," %08X",MVP06_MEM32(d+i*4));
+    }
+    fputc('\n',stderr); fflush(stderr);
+}
 
 /* ── Manual function overrides ─────────────────────────────── */
 
@@ -258,6 +358,17 @@ void recomp_icall_fail_log(uint32_t va)
 {
     fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X (total calls: %llu)\n",
             va, (unsigned long long)g_icall_count);
+    /* A return instruction can appear here after stack corruption. Record
+     * the calling frame before treating every unresolved VA as a new seed. */
+    fprintf(stderr, "  Guest eax=%08X ecx=%08X edx=%08X ebx=%08X "
+                    "esi=%08X edi=%08X ebp=%08X esp=%08X\n",
+            g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp, g_esp);
+    if (g_esp >= 0x10000u && g_esp <= 0x04000000u - 64) {
+        fprintf(stderr, "  Guest stack:");
+        for (unsigned i = 0; i < 16; i++)
+            fprintf(stderr, " %08X", MVP06_MEM32(g_esp + i * 4));
+        fputc('\n', stderr);
+    }
 
     /* Dump last 16 call targets from the ring buffer */
     fprintf(stderr, "  Recent ICALL targets:\n");

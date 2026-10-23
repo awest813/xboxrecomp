@@ -1,0 +1,5 @@
+add_executable(nv2a_pb_scan_smoke main.c)
+target_link_libraries(nv2a_pb_scan_smoke PRIVATE platform xbox_guest_memory)
+if(MSVC)
+    target_compile_definitions(nv2a_pb_scan_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()

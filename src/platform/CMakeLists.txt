@@ -33,3 +33,7 @@ else()
     target_link_libraries(platform PUBLIC Threads::Threads)
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
+
+# Shared by the lifted CPU, passive bridges and native RAM DMA workers.
+add_library(xbox_guest_memory STATIC guest_memory.c)
+target_link_libraries(xbox_guest_memory PUBLIC platform)

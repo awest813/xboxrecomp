@@ -259,6 +259,10 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             (unsigned long long)ep->ContextRecord->Rip,
             (unsigned long long)fault_addr,
             ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
+        fprintf(stderr, "  Executable base=0x%llX, fault RVA=0x%llX\n",
+            (unsigned long long)(uintptr_t)GetModuleHandleA(NULL),
+            (unsigned long long)(ep->ContextRecord->Rip
+                - (uintptr_t)GetModuleHandleA(NULL)));
         fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n",
             g_eax, g_ecx, g_edx, g_esp);
         fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n",
@@ -314,10 +318,15 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         /* Print native stack return addresses for debugging */
         {
             uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
+            uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+            IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+            IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+            uintptr_t end = base + nt->OptionalHeader.SizeOfImage;
             fprintf(stderr, "  Native stack (first 8 return addrs):\n");
             for (int i = 0; i < 64 && sp[i]; i++) {
-                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
-                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
+                if (sp[i] >= base && sp[i] < end) {
+                    fprintf(stderr, "    [%d] 0x%llX (RVA 0x%llX)\n", i,
+                        (unsigned long long)sp[i], (unsigned long long)(sp[i] - base));
                 }
             }
         }
@@ -343,6 +352,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    fprintf(stderr, "[BOOT] Executable base=0x%llX\n",
+            (unsigned long long)(uintptr_t)GetModuleHandleA(NULL));
 
     /* Runtime env defaults come FIRST: memory-layout init and the APU
      * bring-up below read them (RECOMP_AC97_READY decides both whether the
@@ -355,10 +366,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         static const char *const envs[] = {
             "RECOMP_PB_EXEC=1",       /* software NV2A pushbuffer executor */
+            "RECOMP_VBLANK=1",        /* GPU frame clock; D3D waits on it */
+            "RECOMP_GIL=1",
+            /* Hardware rasterization with GPU-resident surfaces: committed
+             * pixels stay on the GPU and page protection materializes them
+             * for any RAM observer. Every batch goes to the GPU (no small-
+             * batch software cutoff), since a GPU draw no longer costs a
+             * readback. 4.3 -> 23.5 FPS at the pitch selector. */
+            "RECOMP_RENDERER=d3d11",
+            "RECOMP_GPU_RESIDENT=1",
+            "RECOMP_GPU_MIN_PIXELS=0",
+            "RECOMP_PACKED_READBACK=1",
+            /* Hold FLIP_STALL until the title's vblank handler advances the
+             * flip (PGRAPH_INCREMENT): its native presentation rate. Without
+             * it the frontend ran at ~120 FPS. */
+            "RECOMP_FLIP_PACING=1",
             "RECOMP_AC97_READY=1",    /* audio codec ready for DSoundCreate */
             "RECOMP_USB=1",           /* OHCI/XPP input stack */
             "RECOMP_USB_PADS=2",
+            "RECOMP_USB_PORT=2",      /* Xbox player 1 is root port 3 */
             "RECOMP_FB_WINDOW=1",     /* show the framebuffer in a window */
+            "RECOMP_KEYBOARD=1",      /* focused window supplies player-one controls */
             /* DSP command doorbells (sub_005C234E spins on [ebx]==0 after
              * writing a command; observed via RECOMP_WATCHDOG_SECS: DSound
              * heap base + 0x810, one per DSP command block — 0x82F20810
@@ -438,6 +466,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
 
+    /* Both direct busy-wait calls and DPC calls use the original PGRAPH
+     * handler wrapper in recomp_manual.c; FIFO writes cannot identify a trap. */
+    {
+        extern void nv2a_trap_enable_handler_hook(void);
+        extern void nv2a_ack_enable_vblank_hook(void);
+        nv2a_trap_enable_handler_hook();
+        nv2a_ack_enable_vblank_hook();
+    }
+
     xbox_OhciInit();
     CreateDirectoryA("saves", NULL);
 
@@ -445,8 +482,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * [device+0x2C] (bytes submitted by the title) against the slot
      * [device+0x30] points at (bytes consumed, engine-written on
      * hardware: 0x82815000 in the ring descriptor). The poll's exit
-     * condition is consumed >= requested, so mirroring submitted into
-     * the consumed slot is the acknowledgement. Identical offsets to
+     * condition is consumed >= requested. Register the semaphore target so
+     * executed GPU release commands publish the consumed sequence; the old
+     * submitted-count mirror is used only without execution. Identical offsets to
      * Burnout 3 (same XDK 5849); the earlier 0x3240/0x3244 guess read
      * the PFIFO CACHE1 pair, which stays zero and is not the gate. */
     xbox_Nv2aMirrorFence(0x00589A38u, 0x2Cu, 0x30u);
@@ -501,7 +539,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("\nStarting game...\n");
     fflush(stdout);
 
-    xbe_entry_point();
+    xbox_GuestCall(xbe_entry_point);
 
     printf("\nGame returned. Cleaning up...\n");
 

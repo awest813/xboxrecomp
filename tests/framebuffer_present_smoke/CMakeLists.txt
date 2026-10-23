@@ -1,0 +1,2 @@
+add_executable(framebuffer_present_smoke main.c)
+target_link_libraries(framebuffer_present_smoke PRIVATE platform user32 gdi32 xbox_guest_memory)

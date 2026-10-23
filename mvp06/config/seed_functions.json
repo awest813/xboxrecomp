@@ -38,5 +38,105 @@
  {
   "start": "0x005E3B67",
   "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00432FBB",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0049E807",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0049E116",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0049D0C0",
+  "note": "VP6 IDCT function pointer installed by 0x0049AD23; 710-instruction MMX body ends at 0x0049DA06."
+ },
+ {
+  "start": "0x0049DA06",
+  "note": "VP6 IDCT function pointer installed by 0x0049AD17; 513-instruction MMX body ends at 0x0049E0C2."
+ },
+ {
+  "start": "0x005E5684",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x005E5065",
+  "note": "XID detach callback adjacent to 0x005E5684 in XPP driver table at 0x005E304C; separate body ends at 0x005E50A0."
+ },
+ {
+  "start": "0x00432FC0",
+  "note": "Indirect-call target observed in run56 after XID attach; standalone five-byte CRT tail jump to 0x0042DD0C."
+ },
+ {
+  "start": "0x000E3020",
+  "note": "Indirect-call target observed in run56 after intro input; separate SEH body, 111 instructions, final ret 4 at 0x000E31B8 and exclusive end 0x000E31BB."
+ },
+ {
+  "start": "0x003DACEB",
+  "note": "Worker entry observed in run57 after mvpintro; separate body with 23-arm switch table at 0x003DAE3B, final ret at 0x003DAE3A."
+ },
+ {
+  "start": "0x005E4C1F",
+  "note": "XID report callback observed in run57 after class GET_REPORT; separate body ends after ret at 0x005E4C70."
+ },
+ {
+  "start": "0x005E4C71",
+  "note": "Adjacent XID report-copy callback, ends with tail jump to 0x00320E1E at 0x005E4C90; same entry region as 0x005E4C1F."
+ },
+ {
+  "start": "0x0042C31C",
+  "note": "Runtime callback entry observed in run58a, xor eax,eax; ret. Also reached by fallthrough after call 0x0042D253 at 0x0042C317; separate address-taken entry, not an omitted switch arm."
+ },
+ {
+  "start": "0x00171D40",
+  "note": "Indirect target reached in run85 exhibition loading; standalone stack-frame body after prior function ends at 0x00171D1B."
+ },
+ {
+  "start": "0x002C8AD0",
+  "note": "Indirect target reached twice in run85 exhibition loading; separate pointer-copy/parameter setup body immediately after sub_002C8A80's end."
+ },
+ {
+  "start": "0x00288EB0",
+  "note": "RECOMP_STUB_TRACE direct tail-call hit in run85; separate stack-frame body after sub_00288DF0 ends at 0x00288E53, returns ret 4."
+ },
+ {
+  "start": "0x00157ED0",
+  "note": "Indirect target reached in run86 exhibition loading; independent player-parameter setup body after table/padding at 0x00157EC4, ret 8 at 0x0015805A."
+ },
+ {
+  "start": "0x002CC3A0",
+  "note": "Indirect target reached in run86 exhibition loading; independent SSE callback after the balanced epilogue/ret at 0x002CC39F, own push ecx and ret at 0x002CC598. Lies inside the detector's oversized 0x002CC0A0 alias range."
+ },
+ {
+  "start": "0x00239420",
+  "note": "Indirect predicate reached ten times in run87 after first live stadium/pitcher/manager intros. Independent body after ret 4 at 0x0023941D; two returns, exclusive end 0x00239540."
+ },
+ {
+  "start": "0x00256590",
+  "note": "Indirect callback missed eleven times in run90 on reaching the pitching view. Independent entry after INT3 padding, own sub esp,0xFC, five balanced returns through exclusive end 0x00256F4E; conditional branch alias at 0x00256C6F is internal. Preserve the complete range."
+ },
+ {
+  "start": "0x00032710",
+  "note": "Indirect callback reached after run91's first 82 MPH fastball. Independent entry after the previous ret at 0x0003270F; push ecx/register saves, 112 instructions and two ret 4 paths through exclusive end 0x00032885. All five direct callees already known."
+ },
+ {
+  "start": "0x001D8240",
+  "note": "Indirect callback reached after run91's first 82 MPH fastball. Independent entry after INT3 padding; push ecx/register saves, 161 instructions and balanced ret at 0x001D84FF, exclusive end 0x001D8500. All six direct callees already known."
+ },
+ {
+  "start": "0x0013D210",
+  "note": "Indirect destructor thunk reached six times when run109 exits the idle stadium demo. Independent 11-byte body at the previous function's exclusive end: store vtable 0x0061960C through ECX, then tail-jump to already translated 0x0013B640; INT3 padding starts at 0x0013D21B."
+ },
+ {
+  "start": "0x0005E440",
+  "note": "Runtime state-machine method table (0x6C3AF8, filled at runtime); dispatch miss when a runner reaches base froze pitching. 16-byte thiscall: test [ecx+0x126], tail-jumps 0x5DBE0."
+ },
+ {
+  "start": "0x00056B60",
+  "note": "Same runtime method table: this-adjusting thunk (mov ecx,[ecx+0x118]; jmp 0x4A4D0)."
  }
 ]

@@ -27,6 +27,15 @@ if(WIN32)
     target_include_directories(d3d8_states_smoke PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11)
 
+    # Compare rendered raw NV2A combiner words with the portable evaluator.
+    add_executable(d3d8_combiners_smoke
+        test_combiners.c
+        ../../src/d3d/d3d8_combiners.c
+        ../../src/kernel/nv2a_combiner.c
+    )
+    target_include_directories(d3d8_combiners_smoke PRIVATE ../../src/d3d)
+    target_link_libraries(d3d8_combiners_smoke PRIVATE platform d3d11 d3dcompiler)
+
     add_executable(d3d8_a8
         test_a8.c
         ../../src/d3d/d3d8_resources.c

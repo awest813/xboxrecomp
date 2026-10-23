@@ -21,12 +21,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../input/xinput_xbox.h"
+#include "platform/guest_memory.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+/* Keep the completed frame separate from guest render targets. Following
+ * clears showed offscreen UI surfaces and half-drawn back buffers. The
+ * executor publishes at FLIP_STALL, as in the reference presentation path. */
+static SRWLOCK      s_present_lock = SRWLOCK_INIT;
+static uint32_t     *s_present;
+static int          s_present_valid;
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -43,7 +51,14 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_KEYDOWN || m == WM_SYSKEYDOWN)
+        xbox_InputSetKeyState((unsigned)w, 1);
+    else if (m == WM_KEYUP || m == WM_SYSKEYUP)
+        xbox_InputSetKeyState((unsigned)w, 0);
+    else if (m == WM_KILLFOCUS)
+        xbox_InputClearKeys();
     if (m == WM_CLOSE || m == WM_DESTROY) {
+        xbox_InputClearKeys();
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
@@ -53,13 +68,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 /* The display formats an Xbox front buffer is actually set to. The pitch says
  * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
  * component layout only matters for 16-bit, where 5:6:5 and 1:5:5:5 differ. */
-static void fb_convert(const uint8_t *src, uint32_t bpp)
+static void fb_convert(const uint8_t *src, uint32_t pitch, uint32_t *pixels)
 {
     uint32_t x, y;
+    uint32_t bpp = pitch / s_fb_width;
 
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * s_fb_pitch;
-        uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
+        const uint8_t *row = src + (size_t)y * pitch;
+        uint32_t *dst = pixels + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
@@ -76,6 +92,64 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
             memset(dst, 0, (size_t)s_fb_width * 4);
         }
     }
+}
+
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+{
+    if (!s_fb_running || !fb_va || !pitch || getenv("RECOMP_FB_VA"))
+        return;
+    xbox_MemoryEnter();
+    AcquireSRWLockExclusive(&s_present_lock);
+    if (!s_present)
+        s_present = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    if (s_present) {
+        const uint8_t *src =
+            (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
+        fb_convert(src, pitch, s_present);
+        s_present_valid = 1;
+    }
+    ReleaseSRWLockExclusive(&s_present_lock);
+    xbox_MemoryLeave();
+}
+
+/* Publish a completed frame the renderer produced itself (a GPU copy of the
+ * surface), in the same format the guest surface would have. No guest RAM
+ * is read, so no RAM reader is taken. */
+void xbox_FramebufferWindowPresentPixels(const uint8_t *pixels, uint32_t pitch)
+{
+    if (!s_fb_running || !pixels || !pitch || getenv("RECOMP_FB_VA"))
+        return;
+    AcquireSRWLockExclusive(&s_present_lock);
+    if (!s_present)
+        s_present = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    if (s_present) {
+        fb_convert(pixels, pitch, s_present);
+        s_present_valid = 1;
+    }
+    ReleaseSRWLockExclusive(&s_present_lock);
+}
+
+/* Whether a window is showing frames, and its size in pixels. */
+int xbox_FramebufferWindowActive(uint32_t *width, uint32_t *height)
+{
+    if (width) *width = s_fb_width;
+    if (height) *height = s_fb_height;
+    return s_fb_running && !getenv("RECOMP_FB_VA");
+}
+
+/* Copy under the same lock as publication, then release it before GDI or
+ * file I/O. Even several flips during a refresh cannot overwrite its pixels. */
+static int fb_copy_presented(uint32_t *pixels)
+{
+    int valid;
+    if (getenv("RECOMP_FB_VA"))
+        return 0;
+    AcquireSRWLockShared(&s_present_lock);
+    valid = s_present_valid;
+    if (valid)
+        memcpy(pixels, s_present, (size_t)s_fb_width * s_fb_height * 4);
+    ReleaseSRWLockShared(&s_present_lock);
+    return valid;
 }
 
 /* Write what the window is currently showing to a 24-bit BMP.
@@ -128,6 +202,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     HDC hdc;
     BITMAPINFO bi;
     RECT r;
+    const char *keyboard = getenv("RECOMP_KEYBOARD");
+    const char *title = keyboard && *keyboard && *keyboard != '0'
+        ? "Xbox Recomp - Framebuffer (Enter: Start, Z: A, arrows: D-pad)"
+        : "Xbox Recomp - Framebuffer";
 
     (void)unused;
 
@@ -142,7 +220,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", title,
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
@@ -175,17 +253,28 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         if (s_fb_va && s_fb_pitch && s_rgb) {
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
-            fb_convert(src, s_fb_pitch / s_fb_width);
+            if (!fb_copy_presented(s_rgb)) {
+                xbox_MemoryEnter();
+                fb_convert(src, s_fb_pitch, s_rgb);
+                xbox_MemoryLeave();
+            }
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         }
         {
-            /* One dump, a few seconds in, so the title has had time to render
-             * something rather than catching the first blank frame. */
+            /* One dump by default. Slow guest startup can outlast that sample;
+             * an optional interval captures the window throughout an intro. */
             const char *dump = getenv("RECOMP_FB_DUMP");
-            static int frames;
-            if (dump && ++frames == 600)
+            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
+            static unsigned frames, dumps;
+            int period = every ? atoi(every) : 0;
+            frames++;
+            if (dump && period > 0 && frames % (unsigned)period == 0) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s.window%03u.bmp", dump, dumps++);
+                xbox_FramebufferDumpBmp(path);
+            } else if (dump && period <= 0 && frames == 600)
                 xbox_FramebufferDumpBmp(dump);
         }
         Sleep(16);
@@ -215,5 +304,8 @@ void xbox_FramebufferWindowStart(void)
 
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowPresentPixels(const uint8_t *pixels, uint32_t pitch) { (void)pixels; (void)pitch; }
+int xbox_FramebufferWindowActive(uint32_t *width, uint32_t *height) { (void)width; (void)height; return 0; }
 void xbox_FramebufferWindowStart(void) {}
 #endif

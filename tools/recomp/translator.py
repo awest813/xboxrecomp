@@ -643,6 +643,12 @@ class FunctionTranslator:
             m = insn.mnemonic
             if m in ("adc", "sbb", "stc", "clc", "cmc"):
                 return True
+            # LAHF now materializes CF too. Arithmetic producers must emit
+            # their carry snapshot even when there is no branch/ADC/SBB.
+            if (m == "lahf" and (last_setter in CF_TRACKED
+                                 or last_setter in ("inc", "dec")
+                                 or last_setter in BT_MODIFY)):
+                return True
             cc = None
             if m.startswith("j") and len(m) > 1:
                 cc = m[1:]
@@ -1234,6 +1240,11 @@ class FunctionTranslator:
         if _last_label_idx is not None and not _has_stmt_after:
             lines.insert(_last_label_idx + 1, "    (void)0;")
 
+        # Keep poll loops and ordinary calls preemptible under a single guest
+        # CPU lock. Disabled builds erase the macros in recomp_types.h.
+        from .scheduler_hints import instrument
+        lines = instrument("\n".join(lines)).splitlines()
+
         # Undefine FPU macros
         if has_fpu:
             lines.extend(FP_STACK_UNDEFS)
@@ -1740,6 +1751,20 @@ class BatchTranslator:
                 f'#include "{header_name}"',
                 "",
             ]
+            stub_lines.extend([
+                '#include <stdio.h>',
+                '#include <stdlib.h>',
+                'static void recomp_stub_note(uint32_t va, unsigned slot) {',
+                '    static int enabled = -1;',
+                f'    static unsigned char seen[{len(unresolved)}];',
+                '    if (enabled < 0) { const char *e = getenv("RECOMP_STUB_TRACE"); enabled = e && *e && *e != \'0\'; }',
+                '    if (enabled && !seen[slot]) {',
+                '        seen[slot] = 1;',
+                '        fprintf(stderr, "[UNLIFTED] direct stub %08X esp=%08X\\n", va, g_esp);',
+                '    }',
+                '}',
+                '',
+            ])
             stub_lines.append(
                 "/* Each stub consumes the return address its caller pushed,")
             stub_lines.append(
@@ -1757,11 +1782,11 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
-            for addr in sorted(unresolved):
+            for slot, addr in enumerate(sorted(unresolved)):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ recomp_stub_note(0x{addr:08X}u, {slot}); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")

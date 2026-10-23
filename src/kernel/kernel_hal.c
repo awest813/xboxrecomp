@@ -24,55 +24,10 @@
  *   APC_LEVEL (1) - APC delivery
  *   DISPATCH_LEVEL (2) - scheduler/DPC level, no page faults allowed
  *
- * On Windows, we simulate IRQL with a thread-local variable. Raising to
- * DISPATCH_LEVEL doesn't actually prevent preemption, but the tracking
- * allows code that checks IRQL to function correctly.
+ * Raised guest regions and device callbacks share a gate. The Xbox has one
+ * CPU: TLS alone allowed two host threads to edit lists protected by IRQL.
+ * The gate implementation lives in kernel_irql.c for native regression.
  * ============================================================================ */
-
-static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
-
-/*
- * KfRaiseIrql - Raises IRQL to the specified level.
- * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
- */
-KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
-{
-    KIRQL old = g_current_irql;
-
-    if (NewIrql < old) {
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
-            "KfRaiseIrql: attempt to lower IRQL from %d to %d (use KfLowerIrql)",
-            old, NewIrql);
-    }
-
-    g_current_irql = NewIrql;
-    return old;
-}
-
-/*
- * KfLowerIrql - Lowers IRQL to the specified level.
- * Uses __fastcall (ECX = NewIrql).
- */
-VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
-{
-    if (NewIrql > g_current_irql) {
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
-            "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
-            g_current_irql, NewIrql);
-    }
-
-    g_current_irql = NewIrql;
-}
-
-/*
- * KeRaiseIrqlToDpcLevel - Convenience function to raise to DISPATCH_LEVEL.
- */
-KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
-{
-    KIRQL old = g_current_irql;
-    g_current_irql = DISPATCH_LEVEL;
-    return old;
-}
 
 /* ============================================================================
  * KeTickCount
@@ -299,14 +254,6 @@ VOID __stdcall xbox_HalDisableSystemInterrupt(ULONG BusInterruptLevel, KIRQL Irq
 {
     (void)BusInterruptLevel;
     (void)Irql;
-}
-
-ULONG __stdcall xbox_HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql)
-{
-    (void)BusInterruptLevel;
-    if (Irql)
-        *Irql = PASSIVE_LEVEL;
-    return 0;
 }
 
 /* ============================================================================

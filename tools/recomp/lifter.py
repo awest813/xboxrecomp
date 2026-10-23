@@ -547,21 +547,30 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
                         "fucomip", "fcomi", "sahf"):
+        # g_fp_cmp is -1 less, 0 equal, 1 greater, 2 unordered. An
+        # unordered compare sets ZF, PF and CF all three, so it reads as
+        # below AND equal AND parity. Comparing g_fp_cmp against 0 made 2 look
+        # "greater": ja/jae went the wrong way on every NaN, and jp/jnp were
+        # constants.
         fpu_cmp_map = {
-            "ja": ">", "jnbe": ">",
-            "jae": ">=", "jnb": ">=", "jnc": ">=",
-            "jb": "<", "jnae": "<", "jc": "<",
-            "jbe": "<=", "jna": "<=",
-            "je": "==", "jz": "==",
-            "jne": "!=", "jnz": "!=",
+            "ja": "(g_fp_cmp == 1)", "jnbe": "(g_fp_cmp == 1)",
+            "jae": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jnb": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jnc": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jb": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
+            "jnae": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
+            "jc": "(g_fp_cmp < 0 || g_fp_cmp == 2)",
+            "jbe": "(g_fp_cmp != 1)", "jna": "(g_fp_cmp != 1)",
+            "je": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
+            "jz": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
+            "jne": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
+            "jnz": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
+            "jp": "(g_fp_cmp == 2)", "jpe": "(g_fp_cmp == 2)",
+            "jnp": "(g_fp_cmp != 2)", "jpo": "(g_fp_cmp != 2)",
         }
-        op = fpu_cmp_map.get(jcc)
-        if op:
-            return f"(g_fp_cmp {op} 0) /* {flag_setter} */", desc
-        if jcc == "jp":
-            return "0 /* fpu: unordered/NaN */", desc
-        if jcc == "jnp":
-            return "1 /* fpu: ordered */", desc
+        expr = fpu_cmp_map.get(jcc)
+        if expr:
+            return f"{expr} /* {flag_setter} */", desc
         return None
 
     # If no operands available for other flag-setters, can't generate condition
@@ -589,23 +598,27 @@ def _make_condition(jcc, flag_setter, flag_ops):
         )
         desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
         a, b = "_fca", "_fcb"
-        # comiss uses unsigned condition codes (CF, ZF)
+        # comiss uses unsigned condition codes (CF, ZF), and an unordered
+        # compare -- either side NaN -- sets ZF, PF and CF all three. The C
+        # relational operators are all false on NaN, which is right for
+        # ja/jae and wrong for everything that reads a set flag.
+        u = f"({a} != {a} || {b} != {b})"
         if jcc in ("ja", "jnbe"):
             return f"({a} > {b})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({a} >= {b})", desc
         if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
+            return f"({a} < {b} || {u})", desc
         if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
+            return f"({a} <= {b} || {u})", desc
         if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
+            return f"({a} == {b} || {u})", desc
         if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
-        if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
-        if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+            return f"({a} != {b} && !{u})", desc
+        if jcc in ("jp", "jpe"):
+            return u, desc
+        if jcc in ("jnp", "jpo"):
+            return f"!{u}", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -2334,8 +2347,7 @@ class Lifter:
     def _analyze_switch_table(self, ops):
         """Detect if an indirect jmp operand is an intra-function switch table.
         Pattern: jmp [reg*scale + table_base] or jmp [reg + table_base]
-        Returns (targets: list[int]) if ALL table entries are within the current
-        function, else empty list."""
+        Returns the contiguous in-function targets, else an empty list."""
         if not ops or ops[0].type != "mem":
             return []
         op = ops[0]
@@ -2371,40 +2383,35 @@ class Lifter:
         # likely a coincidence than a jump table.
         if len(inside) >= 2:
             return inside
-        # Downward-indexed tables: `jmp [neg_reg*4 + base]` reads entries
-        # BELOW the base, which _read_jump_table (reading upward) cannot see
-        # -- it stops at the first non-address and the switch resolves to
-        # nothing, becoming an unresolvable ITAIL. MSVC CRT memcpy's small
-        # backward-count table at base+0x2F88 (entries at base-0x1C..base-4)
-        # is the shape. The emitted comparison code is unchanged: at runtime
-        # the negative index reads one of these entries, and comparing that
-        # value against the collected targets dispatches correctly.
+        # Some tables have an unused first slot, sometimes overlapping the
+        # preceding jmp's bytes (CRT memcpy's alignment tables). Read the
+        # complete run after it: a fixed eight-dword probe silently omitted
+        # the upper arms of XNET's fifteen-arm checksum switch.
+        skipped_first = []
+        for target in self._read_jump_table(table_va + 4):
+            if not (self.func_start <= target < self.func_end):
+                break
+            skipped_first.append(target)
+        if len(skipped_first) >= 2:
+            return skipped_first
+
+        # A negated index reads downward. Include the base itself (index zero)
+        # and stop at the first non-target, with the same 256-entry bound as
+        # forward tables. CRT memcpy's backward-count table needs all eight
+        # entries at base-0x1C..base, including the zero-count epilogue arm.
         if self.xbe_data:
-            for probe_base in (table_va - 32, table_va, table_va + 4):
-                off = va_to_file_offset(probe_base)
-                if off is None:
-                    continue
-                dwords = [struct.unpack_from('<I', self.xbe_data,
-                                             off + i * 4)[0]
-                          for i in range(8)]
-                # Longest run of consecutive in-function entries.
-                best, cur = [], []
-                for val in dwords:
-                    if (is_code_address(val)
-                            and self.func_start <= val < self.func_end):
-                        cur = cur + [val]
-                        if len(cur) > len(best):
-                            best = cur
-                    else:
-                        cur = []
-                # probe_base == table_va+4 covers tables whose first dword
-                # overlaps the preceding jmp instruction's bytes (memcpy's
-                # alignment tables at 0x442D50/0x442EDC read 0x9000442D);
-                # the -32 probe covers negative-index tables. Either way the
-                # runtime index still computes the address the way the guest
-                # did, and the value read is one of these targets.
-                if len(best) >= 2:
-                    return best
+            downward = list(inside)
+            for i in range(1, 256):
+                off = va_to_file_offset(table_va - i * 4)
+                if off is None or off < 0 or off + 4 > len(self.xbe_data):
+                    break
+                target = struct.unpack_from('<I', self.xbe_data, off)[0]
+                if not (is_code_address(target)
+                        and self.func_start <= target < self.func_end):
+                    break
+                downward.append(target)
+            if len(downward) >= 2:
+                return list(reversed(downward))
         return []
 
     def _lift_jmp(self, insn, ops):
@@ -2877,9 +2884,9 @@ class Lifter:
         # ── Scalar (lane 0) access ──
         # movss/addss/... genuinely operate on one 32-bit value, so they read
         # and write lane 0 explicitly rather than the whole register.
-        def _sse_read(op):
+        def _sse_read(op, double_precision=False):
             if _is_xmm(op):
-                return f"{op.reg}.f[0]"
+                return f"{op.reg}.{'d' if double_precision else 'f'}[0]"
             elif op.type == "reg":
                 return op.reg
             elif op.type == "mem":
@@ -3041,14 +3048,16 @@ class Lifter:
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                truncate = int(m == "cvttss2si")
+                return [_fmt_operand_write(ops[0], f"XMM_CVT_F2I({_sse_read(ops[1])}, {truncate})") + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                truncate = int(m == "cvttsd2si")
+                return [_fmt_operand_write(ops[0], f"XMM_CVT_D2I({_sse_read(ops[1], double_precision=True)}, {truncate})") + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
@@ -3570,6 +3579,37 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if curr.mnemonic in ("jecxz", "jcxz"):
             results = lifter._lift_jcc(curr)
             stmts.extend(results)
+            i += 1
+            continue
+
+        # LAHF materializes the tracked SF/ZF/PF/CF in AH. MSVC float
+        # guards use ucomiss/fucomip; lahf; test ah,0x44. A comment left AH
+        # stale and made zero/NaN guards depend on an unrelated EAX value.
+        # Result snapshots already carry width-correct SF and low-byte PF.
+        # AF is available for CMP/ADD/SUB/INC/DEC; other setters retain the
+        # upstream approximation (undefined logical AF reads zero).
+        if curr.mnemonic == "lahf" and last_flag_setter:
+            bits = []
+            for jcc, bit in (("js", 0x80), ("je", 0x40), ("jp", 0x04), ("jb", 0x01)):
+                if last_flag_setter in _RESULT_SNAPSHOT_SETTERS and jcc in ("js", "jp"):
+                    expr = "(_fas < 0)" if jcc == "js" else "RECOMP_PARITY8(_fa)"
+                    bits.append(f"(({expr}) ? 0x{bit:02X}u : 0u)")
+                    continue
+                probe = _make_condition(jcc, last_flag_setter, last_flag_ops)
+                if probe:
+                    bits.append(f"(({probe[0]}) ? 0x{bit:02X}u : 0u)")
+            af = {
+                "cmp": "((_fa ^ _fb ^ (_fa - _fb)) & 0x10u)",
+                "add": "((_fa ^ _fb ^ (_fa - _fb)) & 0x10u)",
+                "sub": "((_fa ^ _fb ^ (_fa + _fb)) & 0x10u)",
+                "inc": "((_fa & 15u) == 0 ? 0x10u : 0u)",
+                "dec": "((_fa & 15u) == 15u ? 0x10u : 0u)",
+            }.get(last_flag_setter)
+            if af:
+                bits.append(af)
+            stmts.append("eax = (eax & 0xFFFF00FFu) | ((uint32_t)("
+                         + " | ".join(bits + ["0x02u"])
+                         + f") << 8); /* lahf ({last_flag_setter}) */")
             i += 1
             continue
 

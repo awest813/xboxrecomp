@@ -106,6 +106,7 @@ VOID InitializeSRWLock(PSRWLOCK lock);
 VOID AcquireSRWLockShared(PSRWLOCK lock);
 VOID ReleaseSRWLockShared(PSRWLOCK lock);
 VOID AcquireSRWLockExclusive(PSRWLOCK lock);
+BOOL TryAcquireSRWLockExclusive(PSRWLOCK lock);
 VOID ReleaseSRWLockExclusive(PSRWLOCK lock);
 
 /* ---- One-time initialisation ------------------------------------------- */

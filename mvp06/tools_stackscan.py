@@ -1,6 +1,7 @@
 """Scan each thread's host stack for return addresses inside the exe,
 resolve them to recomp function names via the .map file, and print the
 reconstructed call chain (innermost frames first)."""
+import argparse
 import bisect
 import ctypes
 import ctypes.wintypes as wt
@@ -17,6 +18,19 @@ k32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                   ctypes.c_void_p, ctypes.c_size_t,
                                   ctypes.POINTER(ctypes.c_size_t)]
 k32.ReadProcessMemory.restype = ctypes.c_bool
+k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+k32.OpenProcess.restype = wt.HANDLE
+k32.OpenThread.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+k32.OpenThread.restype = wt.HANDLE
+k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+k32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+k32.CloseHandle.argtypes = [wt.HANDLE]
+k32.SuspendThread.argtypes = [wt.HANDLE]
+k32.SuspendThread.restype = wt.DWORD
+k32.ResumeThread.argtypes = [wt.HANDLE]
+k32.GetThreadContext.argtypes = [wt.HANDLE, ctypes.c_void_p]
+k32.VirtualQueryEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+k32.VirtualQueryEx.restype = ctypes.c_size_t
 TH32CS_SNAPTHREAD = 0x4
 TH32CS_SNAPMODULE = 0x8
 CONTEXT_FULL = 0x10000B
@@ -55,24 +69,39 @@ def resolve(host_rip, pref, syms, load_base):
     return None, None
 
 def main():
-    env = dict(os.environ); env["RECOMP_VBLANK"] = "1"
-    proc = subprocess.Popen([r"build\Release\mvp06_recomp.exe"], env=env, cwd=".")
-    time.sleep(float(sys.argv[1]) if len(sys.argv) > 1 else 15.0)
-    pid = proc.pid
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("delay", type=float, nargs="?")
+    parser.add_argument("--pid", type=int, help="attach without terminating the target")
+    args = parser.parse_args()
+    proc = None
+    if args.pid:
+        pid = args.pid
+    else:
+        env = dict(os.environ); env["RECOMP_VBLANK"] = "1"
+        proc = subprocess.Popen([r"build\Release\mvp06_recomp.exe"], env=env, cwd=".")
+        pid = proc.pid
+    time.sleep(args.delay if args.delay is not None else (0 if args.pid else 15.0))
     pref, syms = load_map()
 
     h = k32.OpenProcess(0x1F0FFF, False, pid)
+    if not h:
+        raise ctypes.WinError(ctypes.get_last_error())
     msnap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)
     me = MODULEENTRY32(); me.dwSize = ctypes.sizeof(me)
     exe_base = None
+    exe_size = 0
     if k32.Module32First(msnap, ctypes.byref(me)):
         while True:
             if me.szModule.decode().lower() == "mvp06_recomp.exe":
                 exe_base = me.modBaseAddr
+                exe_size = me.modBaseSize
                 break
             if not k32.Module32Next(msnap, ctypes.byref(me)):
                 break
     k32.CloseHandle(msnap)
+    if exe_base is None:
+        k32.CloseHandle(h)
+        raise RuntimeError("Target executable module was not found")
     print(f"exe base {exe_base:#x}")
 
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
@@ -104,14 +133,20 @@ def main():
                 # scan the stack for exe return addresses
                 read = ctypes.c_size_t(0)
                 stack = (ctypes.c_ulonglong * 512)()
+                region = ctypes.create_string_buffer(48)
+                amount = ctypes.sizeof(stack)
+                if k32.VirtualQueryEx(h, ctypes.c_void_p(rsp), region, len(region)):
+                    base = struct.unpack_from("<Q", region, 0)[0]
+                    size = struct.unpack_from("<Q", region, 24)[0]
+                    amount = min(amount, base + size - rsp)
                 if k32.ReadProcessMemory(h, ctypes.c_void_p(rsp), stack,
-                                         ctypes.sizeof(stack),
+                                         amount,
                                          ctypes.byref(read)):
                     n = read.value // 8
                     found = 0
                     for i in range(n):
                         v = stack[i]
-                        if exe_base <= v < exe_base + 0x3200000:
+                        if exe_base <= v < exe_base + exe_size:
                             nm, of = resolve(v, pref, syms, exe_base)
                             if nm:
                                 frames.append((nm, of))
@@ -124,7 +159,9 @@ def main():
             print(f"tid {tid}:")
             for nm, of in frames:
                 print(f"    {nm}+{of:#x}")
-    proc.kill()
+    k32.CloseHandle(h)
+    if proc:
+        proc.kill()
 
 if __name__ == "__main__":
     main()
