@@ -4142,3 +4142,13 @@ Block VP: nv2a_vp_run_block runs the decoded program over 8 lanes with
 SoA registers, identical float order; pool chunks and small batches use it and
 unread inputs are not fetched. 191 M lanes bit-identical (RECOMP_VP_BLOCK_CHECK).
 Worker build time 10.8–12.2 → 9.4–10.1 ms/flip (run252 vs run251).
+
+## 2026-10-23 — Documentation reorganized
+
+AGENTS.md, HANDOFF.md, PLAYABILITY_PLAN.md and the root README each had grown a
+run-by-run checkpoint wall (runs 52–162, the 2–5 FPS software/readback era) ahead
+of their current content. Those sections moved verbatim to mvp06/docs/archive/.
+HANDOFF now opens with one current-state table, prioritized open issues and the
+measurement helpers. AGENTS.md keeps the rules, commands, debugging loop,
+coherence model and traps. PLAYABILITY_PLAN gains a milestone status table and
+the residency, pacing and reference-check decisions.

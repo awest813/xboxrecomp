@@ -1,6 +1,8 @@
 # MVP 06 NCAA Baseball — Xbox → Windows Static Recompilation Plan
 
-Status: **audited, Phase 0–1 in progress** (this document written 2026-10-08, toolkit v0.11.0)
+Status: **historical plan** (written 2026-10-08, toolkit v0.11.0). Milestones are
+tracked in [docs/PLAYABILITY_PLAN.md](docs/PLAYABILITY_PLAN.md) and current state in
+[docs/HANDOFF.md](docs/HANDOFF.md). The enhancement phases (Phase 4) still apply after "playable".
 
 Goal: a native Windows x64 port of MVP 06 NCAA Baseball (USA, retail) built with the
 xboxrecomp static-recompilation toolkit, preserving original gameplay/art, then layered
