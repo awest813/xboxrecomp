@@ -9,6 +9,7 @@ void xbox_GuestLeave(void);
 int xbox_GuestSuspend(void);
 void xbox_GuestResume(int depth);
 void xbox_GuestCall(void (*fn)(void));
+void xbox_GuestKernelCall(uint32_t ordinal,void (*fn)(void));
 void recomp_preempt(void);
 extern volatile LONG g_guest_contended;
 KIRQL xbox_CurrentIrql(void);

@@ -1,3 +1,5 @@
+> Historical checkpoint report. Its process/default/next-action statements apply to that run. Current state: [HANDOFF.md](HANDOFF.md); report index: [README.md](README.md).
+
 # Readback pipeline experiments172–173 (2026-10-30)
 
 Goal remains steady30FPS in gameplay, then rendering/accuracy. Previous turn

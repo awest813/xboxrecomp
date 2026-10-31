@@ -1,5 +1,20 @@
 # Memory Layout Reproduction
 
+## Implementation checkpoint (2026-10-31)
+
+The examples below describe the address model; source and title-specific
+loader settings are authoritative. The current ordinary heap reuses freed
+blocks and serializes allocation, zero-fill, free/coalescing and size queries.
+Worker TIB construction can run outside the lifted CPU lock, so its allocator
+requires its own lock. Worker-stack capacity/reclamation is also serialized.
+
+The graphics contiguous window has separate backing from low-RAM mirrors;
+its tiled view aliases that graphics backing. It is still bump-only, and
+the current contiguous-free bridge does not reclaim from it. MVP run184
+exhausted the arena after demo/loading cycles. Preserve reserved/pinned
+ranges and backing identity when repairing this lifetime defect. See the
+[current handoff](../../mvp06/docs/HANDOFF.md) for evidence and scope.
+
 How to map Xbox memory at its original virtual addresses on Windows so that recompiled code with hardcoded addresses works unmodified.
 
 ## The Problem

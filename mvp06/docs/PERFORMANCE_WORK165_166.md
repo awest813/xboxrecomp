@@ -1,3 +1,5 @@
+> Historical checkpoint report. Its process/default/next-action statements apply to that run. Current state: [HANDOFF.md](HANDOFF.md); report index: [README.md](README.md).
+
 # Readback attribution and bounds optimization — 2026-10-23
 
 The source now attributes external GPU resolves by executor caller and bounds

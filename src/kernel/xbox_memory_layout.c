@@ -2406,8 +2406,13 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  *
  * Simple bump allocator for MmAllocateContiguousMemory and similar.
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
- * No free support (bump-only for now).
+ * Freed blocks are reused before advancing the bump pointer.
  */
+/* The RAM gate excludes device writes, but permits concurrent host readers.
+ * Thread startup allocates TLS outside the lifted CPU lock, so that lock also
+ * cannot protect this table. Keep selection, zero-fill and publication under
+ * one allocator lock to prevent live TIBs overlapping ordinary allocations. */
+static SRWLOCK g_heap_lock = SRWLOCK_INIT;
 static uint32_t g_heap_next = XBOX_HEAP_BASE;
 
 static int g_heap_alloc_count = 0;
@@ -2436,6 +2441,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 #define XBOX_MAX_THREAD_STACKS  8
 
 static int g_thread_stacks_used = 0;
+static SRWLOCK g_thread_stack_lock = SRWLOCK_INIT;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -2499,7 +2505,9 @@ uint32_t xbox_AllocThreadStack(void)
 {
     uint32_t base;
 
+    AcquireSRWLockExclusive(&g_thread_stack_lock);
     if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
+        ReleaseSRWLockExclusive(&g_thread_stack_lock);
         return 0;
     }
 
@@ -2518,9 +2526,12 @@ uint32_t xbox_AllocThreadStack(void)
      * for small ones.
      */
     base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
-    if (!base)
+    if (!base) {
+        ReleaseSRWLockExclusive(&g_thread_stack_lock);
         return 0;
+    }
     g_thread_stacks_used++;
+    ReleaseSRWLockExclusive(&g_thread_stack_lock);
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
@@ -2545,9 +2556,11 @@ void xbox_FreeThreadStack(uint32_t stack_top)
     if (!stack_top)
         return;
     xbox_MemoryEnter();
+    AcquireSRWLockExclusive(&g_thread_stack_lock);
     xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
     if (g_thread_stacks_used > 0)
         g_thread_stacks_used--;
+    ReleaseSRWLockExclusive(&g_thread_stack_lock);
     xbox_MemoryLeave();
 }
 
@@ -2621,7 +2634,7 @@ int xbox_ContiguousIsPhysical(uint32_t phys)
 }
 
 
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+static uint32_t heap_alloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -2717,6 +2730,15 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     return result;
 }
 
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t result;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    result = heap_alloc(size, alignment);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return result;
+}
+
 /* How big is the block at this guest address?
  *
  * MmQueryAllocationSize and ExQueryPoolBlockSize both ask this, and both used
@@ -2730,7 +2752,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
  * forward is asking about the block that contains it. Returns 0 for an address
  * this heap never handed out, which is what "not one of mine" has to look like.
  */
-uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+static uint32_t heap_block_size(uint32_t xbox_va)
 {
     int i;
 
@@ -2746,7 +2768,16 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+{
+    uint32_t size;
+    AcquireSRWLockShared(&g_heap_lock);
+    size = heap_block_size(xbox_va);
+    ReleaseSRWLockShared(&g_heap_lock);
+    return size;
+}
+
+static void heap_free(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
@@ -2788,6 +2819,13 @@ void xbox_HeapFree(uint32_t xbox_va)
         }
         return;
     }
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    AcquireSRWLockExclusive(&g_heap_lock);
+    heap_free(xbox_va);
+    ReleaseSRWLockExclusive(&g_heap_lock);
 }
 
 HANDLE xbox_GetMappingHandle(void)

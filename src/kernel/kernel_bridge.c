@@ -8952,23 +8952,7 @@ static void kernel_thunk_dispatch(void)
 {
     int slot = g_kernel_dispatch_slot;
     ULONG ordinal = slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE ? g_slot_ordinals[slot] : 0;
-    /* Time queries and IRQL transitions do not block. Raised guest regions
-     * must retain the CPU throughout their kernel calls, just as an ISR does.
-     * A contended IRQL gate explicitly parks the CPU in kernel_irql.c. */
-    if (xbox_CurrentIrql() >= DISPATCH_LEVEL || ordinal == 103 || ordinal == 129
-            || ordinal == 130 || ordinal == 160 || ordinal == 161
-            || (ordinal >= 125 && ordinal <= 128)) {
-        kernel_thunk_dispatch_body();
-    } else {
-        /* Keep buffer accesses protected while the bridge parks the guest
-         * CPU. The actual host-wait paths release this memory lease only
-         * after copying their arguments, then reacquire before RAM access. */
-        xbox_MemoryEnter();
-        int depth = xbox_GuestSuspend();
-        kernel_thunk_dispatch_body();
-        xbox_GuestResume(depth);
-        xbox_MemoryLeave();
-    }
+    xbox_GuestKernelCall(ordinal,kernel_thunk_dispatch_body);
 }
 
 static void kernel_thunk_dispatch_body(void)

@@ -65,6 +65,10 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/guest_scheduler_smoke
                  ${CMAKE_CURRENT_BINARY_DIR}/guest_scheduler_smoke)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/memory_scope_smoke
                  ${CMAKE_CURRENT_BINARY_DIR}/memory_scope_smoke)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/heap_concurrency_smoke
+                 ${CMAKE_CURRENT_BINARY_DIR}/heap_concurrency_smoke)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/critical_section_smoke
+                 ${CMAKE_CURRENT_BINARY_DIR}/critical_section_smoke)
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

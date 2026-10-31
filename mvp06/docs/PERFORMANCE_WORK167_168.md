@@ -1,3 +1,5 @@
+> Historical checkpoint report. Its process/default/next-action statements apply to that run. Current state: [HANDOFF.md](HANDOFF.md); report index: [README.md](README.md).
+
 # Gameplay performance experiments 167–168
 
 The tighter triangle bounds reduce readback traffic, but the matched gameplay

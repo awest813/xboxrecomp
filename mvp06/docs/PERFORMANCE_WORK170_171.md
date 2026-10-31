@@ -1,3 +1,5 @@
+> Historical checkpoint report. Its process/default/next-action statements apply to that run. Current state: [HANDOFF.md](HANDOFF.md); report index: [README.md](README.md).
+
 # Toward steady 30 FPS: runs170–171 (2026-10-30)
 
 Goal remains steady30 FPS in gameplay, followed by rendering and accuracy work.

@@ -1,3 +1,5 @@
+> Historical checkpoint report. Its process/default/next-action statements apply to that run. Current state: [HANDOFF.md](HANDOFF.md); report index: [README.md](README.md).
+
 # Matched gameplay test rejects direct packed buffers (2026-10-30)
 
 The30FPS gameplay goal remains active and unachieved. Previous turn made

@@ -14,6 +14,15 @@ static uint64_t s_next, s_serving;
 static volatile LONG s_enabled = -1;
 static XBOX_THREAD_LOCAL int s_depth;
 volatile LONG g_guest_contended;
+static volatile LONG s_cs_guest_fastpath=-1;
+static int cs_guest_fastpath(void)
+{
+    if(s_cs_guest_fastpath<0) {
+        const char *e=getenv("RECOMP_CS_GUEST_FASTPATH");
+        InterlockedCompareExchange(&s_cs_guest_fastpath,e && *e=='1',-1);
+    }
+    return s_cs_guest_fastpath!=0;
+}
 
 static int enabled(void)
 {
@@ -85,6 +94,24 @@ void xbox_GuestResume(int depth)
 void xbox_GuestCall(void (*fn)(void))
 {
     xbox_GuestEnter(); fn(); xbox_GuestLeave();
+}
+void xbox_GuestKernelCall(uint32_t ordinal,void (*fn)(void))
+{
+    int depth;
+    /* Keep raised regions and the existing nonblocking queries on the CPU.
+     * Optional critical-section handling parks only on actual contention;
+     * uncontended Enter/Leave need no host-thread scheduling round trip. */
+    if(xbox_CurrentIrql()>=DISPATCH_LEVEL || ordinal==103 || ordinal==129
+        || ordinal==130 || ordinal==160 || ordinal==161
+        || (ordinal>=125 && ordinal<=128)
+        || (cs_guest_fastpath() && (ordinal==277 || ordinal==278
+                                   || ordinal==294 || ordinal==295))) {
+        fn();return;
+    }
+    /* Retain native buffer publication until the bridge completes. Real host
+     * waits copy their arguments before releasing and restoring RAM access. */
+    xbox_MemoryEnter();depth=xbox_GuestSuspend();fn();
+    xbox_GuestResume(depth);xbox_MemoryLeave();
 }
 void recomp_preempt(void)
 {

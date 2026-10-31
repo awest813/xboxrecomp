@@ -1,3 +1,5 @@
+> Historical checkpoint report. Its process/default/next-action statements apply to that run. Current state: [HANDOFF.md](HANDOFF.md); report index: [README.md](README.md).
+
 # Performance check — 2026-10-23, Release164
 
 The previous performance improvements are still installed. Comparing the

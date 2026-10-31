@@ -1,3 +1,5 @@
+> Historical checkpoint report. Its process/default/next-action statements apply to that run. Current state: [HANDOFF.md](HANDOFF.md); report index: [README.md](README.md).
+
 # Bounded CPU/GPU handoff: measured gain, 30 FPS still open
 
 Commit checkpoint (2026-10-31): the subsequent normal179 launch, run180,

@@ -1,5 +1,17 @@
 # Xbox Kernel Replacement
 
+## Current scheduling note (2026-10-31)
+
+The import-count examples below are title-specific. MVP uses153 imports; the
+runtime routes371 kernel export ordinals, with behavioral gaps still open.
+Kernel dispatch now shares its CPU-retention policy through
+`xbox_GuestKernelCall`. Raised-IRQL regions and existing nonblocking queries
+retain the CPU. Passive critical-section waits release CPU/RAM only while
+actually blocked; an opt-in CS fast path avoids ordinary CPU handoff on
+uncontended Enter/Leave and remains off by default. Native tests cover both
+policy and GIL modes. This does not establish whole-game performance or
+accuracy; see the [MVP system audit](../../mvp06/docs/SYSTEM_PERFORMANCE_AUDIT184.md).
+
 Mapping 147 Xbox kernel imports to Windows equivalents for recompiled game code.
 
 ## How Xbox Kernel Imports Work
