@@ -318,11 +318,12 @@ static int draw_bounds(const Nv2aRenderBatch *b,uint32_t width,uint32_t dwidth,
 }
 /* A CPU/software edit between GPU batches need not re-upload a whole target.
  * Compare every row, then find changed pixel bounds in differing rows. */
+#include "nv2a_surface_diff.h"
 static int changed_bounds(const uint8_t *ram,uint32_t pitch,const uint8_t *shadow,
                           uint32_t shadow_pitch,uint32_t width,uint32_t height,
                           uint32_t bpp,int force,D3D11_BOX *box)
 {
-    uint32_t x,y;
+    uint32_t x,y,right;
     box->left=0;box->top=0;box->right=width;box->bottom=height;
     box->front=0;box->back=1;
     if(force)return 1;
@@ -330,10 +331,9 @@ static int changed_bounds(const uint8_t *ram,uint32_t pitch,const uint8_t *shado
     for(y=0;y<height;y++) {
         const uint8_t *a=ram+(size_t)y*pitch,*b=shadow+(size_t)y*shadow_pitch;
         if(!memcmp(a,b,(size_t)width*bpp))continue;
-        for(x=0;x<width && !memcmp(a+(size_t)x*bpp,b+(size_t)x*bpp,bpp);x++);
+        nv2a_surface_row_bounds(a,b,width,bpp,&x,&right);
         if(x<box->left)box->left=x;
-        for(x=width;x && !memcmp(a+(size_t)(x-1)*bpp,b+(size_t)(x-1)*bpp,bpp);x--);
-        if(x>box->right)box->right=x;
+        if(right>box->right)box->right=right;
         if(y<box->top)box->top=y;
         box->bottom=y+1;
     }

@@ -141,10 +141,20 @@ static void continuous_producer(void)
     assert(calls[1].method==0x100 && calls[1].value==5);
     puts("Continuous producer exceeds four million words and retires fence/NOP without skipping");
 }
+static void advisory_request_expiry(void)
+{
+    reset(0x100);arena[0x100/4]=header(1,0,0x200);arena[0x104/4]=42;
+    InterlockedExchange((volatile LONG*)&g_guest_gpu_contended,1);
+    assert(nv2a_pb_scan_slice(0x108,1,0,0,NULL)==0x104);
+    assert(g_guest_gpu_contended==1); /* partial work still wants exclusion */
+    assert(nv2a_pb_scan_slice(0x8000010Bu,1,0,0,NULL)==0x108);
+    assert(g_guest_gpu_contended==0 && call_count==1 && calls[0].value==42);
+    puts("Completed submission expires its advisory GPU request; partial slices retain it");
+}
 int main(void)
 {
     packet_split(); call_and_wrap(); reset_and_invalid(); bounded_and_trap();
-    continuous_producer(); survey_only();
+    continuous_producer(); advisory_request_expiry(); survey_only();
     puts("DMA packet continuation, calls/returns, ring wraps, reset and GET ownership passed");
     return 0;
 }

@@ -1,5 +1,60 @@
 # AGENTS.md — working instructions for AI agents on the MVP 06 recomp
 
+CHECKPOINT180 (2026-10-31): normal179 startup without diagnostic traces
+crashed (exit0xC0000005, guest TLS lookup in sub_0031D5BF). Cause unresolved;
+investigate TIB/TLS initialization before normal-profile FPS measurements.
+See docs/PERFORMANCE_WORK176_179.md. Separate178 acceptance remains historical.
+
+LATEST179: read docs/PERFORMANCE_WORK176_179.md. Bounded safe-point handoff
+plus reader guard and expiring stale requests at PUT passes native GIL0/1,
+IRQL/publication/host-wait/2,000 DMA checks; walker>4M words/partial request
+expiry passes.176/177 naive waits regressed startup, disabled/stopped; do not
+reuse.178 warm reverse A(no yield)3.800/3.747 vs C(handoff2000)4.100/4.000:
+~7.3% selector gain, unscoped resolves/flip27.245→17.568 (~35.5% fewer).
+Two pitches/count2–0/pause/resume PASS. Live178 PID18740 yield1/handoff2000/
+hold0/poll100/timing0;11 exact downs,3,462 PATH/no logged failures. Never
+relink live178 EXE/MAP. Normal179 rebuilt; MVP defaults tested hardware profile
+but honors overrides. Toolkit handoff/YIELD defaults remain off. Optional
+GPU_OWNER_TRACE records reader callers/tags; native on/off checks pass; actual
+in-game owner attribution and179 non-diagnostic FPS are next.30FPS NOT met.
+New work uncommitted. Normal179 has build/native coverage; gameplay policy
+acceptance is178 with equivalent explicit settings, not a full179 exhibition.
+
+LATEST174/175: read docs/PERFORMANCE_WORK174.md. Same-process direct-buffer
+ABBA3.250/3.697/3.850/3.350 FPS; reverse BAAB3.300/3.600/3.247/3.397 shows
+NO reliable gain. Reject/remove runtime direct option/switch/stats-field and
+transition-only tests; retain private experiment174 snapshot. Restored backend
+175 rebuilt; packed HW/WARP validation logs render175_restore_*.txt.
+Live174 PID24804 stays staging0/hold0/poll100/timing0; never relink EXE/MAP.
+Gate frame107/error1.70, exact7 downs,3,412 PATH/no logged failures. Old171
+deliberately stopped. Normal169 EXE unchanged.30FPS still unachieved. Need
+larger coherence work; contig/tiled graphics aliases differ from low-RAM mirrors.
+Prototype design obligations in report; no resident/protection feature exists.
+
+LATEST173: read docs/PERFORMANCE_WORK172_173.md.171 PID17020 confirmed live;
+thread sample shows GPU synchronization/renderer waits. Driver-thread option
+rejected/removed; mapped default COLOR texture probe slower for large reads.
+New separate173 opt-in RECOMP_PACKED_DIRECT_READBACK=1 maps packed DEFAULT UAV
+buffer, skipping staging copy while retaining completion/RAM/observer rules.
+Default OFF. Hardware/WARP direct512 exact cases each +2,605 batch suites and
+both packed-off modes pass. Native ABBA timings overlap; NO speedup established.
+173 EXE/MAP built, NOT launched/promoted. Live171/normal169 unchanged. Next:
+matched gameplay comparison or reject prototype;30FPS remains unachieved.
+Never relink live171 EXE/MAP. New code/tests/docs uncommitted.
+
+LATEST171 (2026-10-30): goal steady30FPS gameplay FIRST, rendering/accuracy
+afterward. Read docs/PERFORMANCE_WORK170_171.md. No old game live on resume;
+170 diagnostic169 stopped deliberately, intro/title timings NOT gameplay.
+Candidate171 exact64-byte row-bound comparisons pass614,784 oracle cases;
+sparse row native895→126ms, NOT whole-game7x. Hardware/WARP packed/legacy
+renderer pass2,605 draws each. Normal169 EXE unchanged. Separately named171
+PID17020 live, timing0/poll100/testhold0. Selector gate frame097/error1.72,
+two20s samples3.900/3.950 FPS, zero audio rejects, exact7 frontend downs;
+3,416 PATH/no logged failures. NO whole-game speedup/30FPS claim. Native
+micro-optimization cannot solve dominant repeated readback/handoff costs.
+Next investigate larger batching/coherence changes with all visibility rules.
+Never relink live171 EXE/MAP. Two-pitch candidate acceptance still open.
+
 LATEST167/168: read docs/PERFORMANCE_WORK167_168.md. Same-process bounds
 warm reverse BAAB shows NO reliable FPS gain; readback about7% lower. Adaptive
 flag polling100us (2ms fast burst after WC requests) cuts worker CPU93–94% in

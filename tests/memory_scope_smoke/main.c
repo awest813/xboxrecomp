@@ -134,6 +134,48 @@ static void test_gpu_safe_point(unsigned iteration)
     assert(packet[0]==value && packet[1]==value);
     xbox_GuestLeave();CloseHandle(thread);
 }
+#ifdef _WIN32
+static DWORD WINAPI retain_reader(LPVOID unused)
+{
+    (void)unused;xbox_MemoryEnter();SetEvent(ready);
+    assert(WaitForSingleObject(proceed,3000)==WAIT_OBJECT_0);
+    xbox_MemoryLeave();return 0;
+}
+static void test_other_reader_skips_handoff(void)
+{
+    HANDLE thread;uint32_t ticket;
+    ResetEvent(ready);ResetEvent(proceed);xbox_GuestEnter();
+    thread=CreateThread(NULL,0,retain_reader,NULL,0,NULL);assert(thread);
+    assert(WaitForSingleObject(ready,1000)==WAIT_OBJECT_0);
+    InterlockedExchange((volatile LONG*)&g_guest_gpu_contended,1);
+    assert(!xbox_MemoryPrepareGpuYield(&ticket));
+    SetEvent(proceed);assert(WaitForSingleObject(thread,3000)==WAIT_OBJECT_0);CloseHandle(thread);
+    InterlockedExchange((volatile LONG*)&g_guest_gpu_contended,0);xbox_GuestLeave();
+    puts("A distinct retained bridge/DMA reader prevents the handoff wait");
+}
+static void test_missing_gpu_timeout(void)
+{
+    uint32_t ticket;int depth,prepared;LARGE_INTEGER frequency,begin,end;
+    xbox_GuestEnter();InterlockedExchange((volatile LONG*)&g_guest_gpu_contended,1);
+    xbox_MemoryEnter();assert(!xbox_MemoryPrepareGpuYield(&ticket));xbox_MemoryLeave();
+    prepared=xbox_MemoryPrepareGpuYield(&ticket);
+    if(prepared) {
+        LONG before=packet[0];
+        depth=xbox_GuestSuspend();QueryPerformanceFrequency(&frequency);
+        xbox_MemoryGpuIdle();xbox_MemoryWaitGpu(ticket); /* canceled request returns */
+        assert(!g_guest_gpu_contended && packet[0]==before && packet[1]==before);
+        InterlockedExchange((volatile LONG*)&g_guest_gpu_contended,1);
+        QueryPerformanceCounter(&begin);
+        /* No GPU thread is alive to acknowledge this request. */
+        xbox_MemoryWaitGpu(ticket);QueryPerformanceCounter(&end);xbox_GuestResume(depth);
+        assert(packet[0]==before && packet[1]==before);
+        assert((end.QuadPart-begin.QuadPart)*1000.0/frequency.QuadPart<500);
+        printf("Missing GPU handoff times out without fabricated progress: %.3f ms\n",
+            (end.QuadPart-begin.QuadPart)*1000.0/frequency.QuadPart);
+    } else puts("Bounded GPU handoff disabled; ordinary yield retained");
+    InterlockedExchange((volatile LONG*)&g_guest_gpu_contended,0);xbox_GuestLeave();
+}
+#endif
 int main(void)
 {
     HANDLE thread;
@@ -203,6 +245,10 @@ int main(void)
     InterlockedExchange(&stop,1);
     assert(WaitForSingleObject(thread,3000)==WAIT_OBJECT_0);CloseHandle(thread);
     for(i=0;i<32;i++)test_gpu_safe_point(i);
+#ifdef _WIN32
+    test_other_reader_skips_handoff();
+    test_missing_gpu_timeout();
+#endif
     puts(automatic_yield
         ? "32 GPU safe-point handoffs without a competing guest CPU; extra RAM references and raised IRQL remain protected"
         : "32 manual GPU handoffs with requests disabled; ordinary safe points retain the guest reader");

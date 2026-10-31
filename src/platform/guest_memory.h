@@ -29,4 +29,13 @@ int xbox_MemoryGpuOwned(void);
  * across ordinary preemption; only the single lifted-CPU reader may yield. */
 extern volatile int32_t g_guest_gpu_contended;
 int xbox_MemoryGpuYieldAllowed(void);
+/* Optional bounded handoff at a lifted safe point. Prepare while the sole
+ * lifted reader is held, then wait only after releasing CPU and RAM leases.
+ * Never used by publication readers or at raised IRQL. Default disabled. */
+int xbox_MemoryPrepareGpuYield(uint32_t *ticket);
+void xbox_MemoryWaitGpu(uint32_t ticket);
+/* The walker consumed the captured submission. Expire its advisory request;
+ * any owned GPU lease still lasts until pixel commit. This does not publish
+ * completion or release ownership. Idle work must not throttle guest polling. */
+void xbox_MemoryGpuIdle(void);
 #endif

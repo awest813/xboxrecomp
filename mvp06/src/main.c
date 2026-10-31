@@ -366,6 +366,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         static const char *const envs[] = {
             "RECOMP_PB_EXEC=1",       /* software NV2A pushbuffer executor */
+            /* Validated hardware profile; explicit user overrides win below.
+             * Coherence and interrupt barriers remain in the shared runtime. */
+            "RECOMP_RENDERER=d3d11",
+            "RECOMP_PACKED_READBACK=1",
+            "RECOMP_GPU_SCOPES=1",
+            "RECOMP_GPU_MIN_PIXELS=4096",
+            "RECOMP_GPU_YIELD=1",
+            "RECOMP_GPU_HANDOFF_US=2000",
+            "RECOMP_VBLANK=1",
             "RECOMP_AC97_READY=1",    /* audio codec ready for DSoundCreate */
             "RECOMP_USB=1",           /* OHCI/XPP input stack */
             "RECOMP_USB_PADS=2",

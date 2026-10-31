@@ -488,7 +488,7 @@ static void coherent_scopes(void)
     }
     puts("Scoped draws match synchronous Z16/Z24/blend pixels; target, color/depth source, palette, CPU-edit, overlapping targets and fallback barriers pass");
 }
-static int benchmark_depth_toggle(int clipped)
+static int benchmark_depth_toggle(int clipped,int readback_only)
 {
     Nv2aRenderBatch b={0};Nv2aRenderVertex v[3]={0};
     Nv2aRenderStats before,after;
@@ -496,9 +496,14 @@ static int benchmark_depth_toggle(int clipped)
     uint32_t *depth=(uint32_t*)malloc(640*480*4);
     LARGE_INTEGER frequency,start,end;
     unsigned i,pass;
+    unsigned edge=readback_only?256:32;
+    if(readback_only && getenv("RECOMP_TEST_READBACK_EDGE")) {
+        unsigned value=(unsigned)strtoul(getenv("RECOMP_TEST_READBACK_EDGE"),NULL,10);
+        if(value>=32 && value<=480)edge=value;
+    }
     assert(color && depth);memset(depth,0xFF,640*480*4);
     for(i=0;i<3;i++) {
-        v[i].position[0]=i==1?40:8;v[i].position[1]=i==2?40:8;
+        v[i].position[0]=i==1?(float)(8+edge):8;v[i].position[1]=i==2?(float)(8+edge):8;
         v[i].position[2]=8388608;v[i].position[3]=1;
         v[i].diffuse[0]=v[i].diffuse[3]=1;
     }
@@ -512,16 +517,20 @@ static int benchmark_depth_toggle(int clipped)
         nv2a_render_get_stats(&before);QueryPerformanceCounter(&start);
         for(i=0;i<100;i++) {
             /* A HUD phase, then resumed depth, with independent CPU edits. */
-            b.depth_test=0;b.height=b.clip_h=clipped?64:480;assert(nv2a_render_draw(&b));
-            color[479*640+639]=0x12345678;
-            depth[479*640+639]=0x765432A5;
+            if(!readback_only) {
+                b.depth_test=0;b.height=b.clip_h=clipped?64:480;assert(nv2a_render_draw(&b));
+                color[479*640+639]=0x12345678;
+                depth[479*640+639]=0x765432A5;
+            }
             b.depth_test=1;b.height=b.clip_h=480;assert(nv2a_render_draw(&b));
             assert(color[10*640+10]==0xFFFF0000);
-            assert(color[479*640+639]==0x12345678 && depth[479*640+639]==0x765432A5);
+            if(!readback_only)assert(color[479*640+639]==0x12345678 && depth[479*640+639]==0x765432A5);
         }
         QueryPerformanceCounter(&end);nv2a_render_get_stats(&after);
-        printf("depth-toggle pass%u: %.6f ms/pair, %llu uploads, %llu bytes\n",pass,
+        printf("%s pass%u: %.6f ms/%s, %llu uploads, %llu bytes\n",
+            readback_only?"readback":"depth-toggle",pass,
             1000.0*(end.QuadPart-start.QuadPart)/frequency.QuadPart/100,
+            readback_only?"draw":"pair",
             (unsigned long long)(after.surface_uploads-before.surface_uploads),
             (unsigned long long)(after.surface_upload_bytes-before.surface_upload_bytes));
     }
@@ -536,9 +545,10 @@ int main(int argc,char **argv)
     unsigned family,sample,i,failures=0;
     int bounds_only=argc==2 && !strcmp(argv[1],"--bounds-only");
     int clipped=argc==2 && !strcmp(argv[1],"--benchmark-depth-toggle-clipped");
-    int bench=clipped || (argc==2 && !strcmp(argv[1],"--benchmark-depth-toggle"));
+    int readback_only=argc==2 && !strcmp(argv[1],"--benchmark-readback");
+    int bench=readback_only || clipped || (argc==2 && !strcmp(argv[1],"--benchmark-depth-toggle"));
     _putenv_s("RECOMP_RENDERER",bounds_only || bench || (argc==2 && !strcmp(argv[1],"--hardware"))?"d3d11":"warp");
-    if(bench)return benchmark_depth_toggle(clipped);
+    if(bench)return benchmark_depth_toggle(clipped,readback_only);
     if(bounds_only) {
         assert(nv2a_render_enabled());offscreen_batch_bounds();nv2a_render_shutdown();return 0;
     }

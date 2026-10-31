@@ -14,7 +14,20 @@ layered on top — see [NOTICE](NOTICE) and [mvp06/docs/ENGINEERING_LOG.md](mvp0
 > in this repository, ever. The lifted C is mechanically derived from the
 > game's own code and is rebuilt locally from your own disc dump.
 
-## Status (2026-10-20 — bring-up in progress; work paused)
+## Status (2026-10-30 — performance work active)
+
+Steady30FPS in gameplay remains the priority and is not achieved. A matched
+warm reverse pitching-selector comparison improves3.77→4.05FPS (about7.3%)
+with bounded CPU-to-GPU ownership handoff, and reduces unscoped readbacks by
+35.5%. Two pitches/count2–0 and pause/resume pass with that policy. These are
+scene-specific results, not a broad gameplay speedup or full-exhibition claim.
+
+MVP defaults now select D3D11, packed readback, RAM scopes, the4096-pixel cutoff,
+vblank and the validated handoff. Explicit environment overrides remain honored;
+`RECOMP_GPU_YIELD=0` disables the handoff. Toolkit-wide handoff stays opt-in.
+See [the current performance report](mvp06/docs/PERFORMANCE_WORK176_179.md).
+
+### Historical checkpoint (2026-10-20)
 
 **Both intro movies, the full Play Now frontend, stadium rendering, pitching
 and pause/resume are verified.** Normal run160 on Release159 with the selected

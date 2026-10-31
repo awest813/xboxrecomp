@@ -1,5 +1,57 @@
 # MVP 06 NCAA Baseball — Handoff
 
+Checkpoint180 (2026-10-31): normal179 run180 crashed at startup with
+0xC0000005 in the guest TLS lookup (sub_0031D5BF). Cause unresolved; normal179
+startup and non-diagnostic FPS are unvalidated. Investigate thread TIB/TLS
+initialization next; see PERFORMANCE_WORK176_179.md for the recorded failure.
+
+Latest179: see PERFORMANCE_WORK176_179.md.178 warm reverse shows bounded
+handoff improves selector3.7735→4.05FPS (~7.3%), unscoped resolves35.5% lower.
+Native GIL0/1/publication/IRQL/DMA and walker partial/PUT expiry checks pass.
+176/177 waits regressed startup due stale request; disabled/stopped.178 fixes
+expiry at actual captured PUT. Two pitches/count2–0/pause/resume PASS, exact11
+downs,3,462 PATH/no logged failures. Live178 PID18740 keeps yield1/us2000,
+hold0/poll100/timing0. Never relink its EXE/MAP. Normal179 rebuilt with MVP
+hardware defaults honoring overrides; toolkit defaults remain off.179's profile
+matches accepted178 settings; no separate full179 exhibition claimed. Optional
+GPU_OWNER_TRACE/native on/off tests and private reader ready; actual owner
+attribution and normal179 no-diagnostic FPS next.30FPS not met; new work
+uncommitted. Inspect current process/log before relying on historical PIDs.
+
+Latest174/175: PERFORMANCE_WORK174.md records matched direct-buffer comparison.
+Initial apparent gain fails warm reverse; runtime option/switch/stats-field
+and mode-transition tests removed. Native probes retained; restored backend175
+build and HW/WARP packed checks. Source snapshot/evidence under build/experiment174.
+Live174 PID24804 remains staging0/hold0/poll100/timing0; do not relink EXE/MAP.
+Selector frame107/error1.70;3,412 PATH/exact7 frontend downs/no logged failures.
+Old171 deliberately stopped (exitFFFFFFFF), normal169 EXE unchanged.30FPS is
+unachieved: samples3.25–3.85. Next reduce readback/ownership round trips with
+verified visibility; report lists obligations before GPU residency can be safe.
+New work remains uncommitted. No175 game executable built/promoted.
+
+Latest173: see PERFORMANCE_WORK172_173.md. Live171 PID17020 remains confirmed,
+hold0/poll100/timing0. Matched-MAP thread sample confirms rendering waits.
+Driver-thread experiment removed; mapped default color textures slower for
+large reads. New173 opt-in direct packed-UAV readback removes a staging copy,
+keeps all visibility/completion rules, passes hardware/WARP exact512 and2,605
+draw suites plus packed-off suites. Native ABBA inconclusive: no speedup claim.
+173 separately built, not launched/promoted; default OFF. Live171/normal169
+unchanged. Next matched gameplay comparison or reject the prototype.30FPS
+remains unachieved. New code/tests/docs uncommitted; never relink live171.
+
+Latest171 (2026-10-30): objective steady30FPS gameplay, then rendering/accuracy.
+Read PERFORMANCE_WORK170_171.md. Exact block row comparisons pass614,784
+oracle cases and four renderer modes, zero failures; native sparse-row~7x
+is NOT a gameplay claim. Separate171 PID17020 is live, hold0/poll100,
+timings off. Selector verified frame097;20s samples3.900/3.950FPS, zero audio
+rejects, exact7 frontend downs,3,416 PATH/no logged failures. No whole-game
+speedup or30FPS claim. Investigate larger readback/coherence costs next, retaining
+all CPU/alias/fence visibility. Read selector171_gate.txt
+and current process; no prior process was live on resume. Diagnostic170 was
+deliberately stopped; its25.9intro/48.9title samples do NOT prove gameplay FPS.
+Normal169 EXE unchanged; do not relink live171 EXE/MAP. Two-pitch/full-game
+acceptance remain pending. New source/tests/docs remain uncommitted.
+
 Latest169: normal Release/mvp06_recomp.exe rebuilt with adaptive idle flag
 poll100us, zero/invalid fallback to old Sleep(0). Two-ms fast burst retains
 WC progress. Matched168 ABBA/BAAB worker CPU93–94% lower, FPS roughly3.9–4.1,

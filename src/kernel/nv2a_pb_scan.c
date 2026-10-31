@@ -281,7 +281,13 @@ uint32_t nv2a_pb_scan_slice(uint32_t put_phys,uint32_t max_words,
     }
     if (s_exec_enabled)
         xbox_Nv2aDmaGet(s_get);
-    if(s_get==put) { s_walk_words=s_unknown_run=0;s_slice_put++; }
+    if(s_get==put) {
+        s_walk_words=s_unknown_run=0;s_slice_put++;
+        /* A failed exclusive try may have finished through synchronous
+         * fallback. No pending work remains to satisfy that advisory request.
+         * An owned scope still commits before releasing RAM exclusion. */
+        xbox_MemoryGpuIdle();
+    }
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;

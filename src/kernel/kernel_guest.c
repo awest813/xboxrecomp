@@ -88,10 +88,13 @@ void xbox_GuestCall(void (*fn)(void))
 }
 void recomp_preempt(void)
 {
-    int depth;
+    int depth,handoff;
+    uint32_t ticket=0;
     if ((!g_guest_contended && !(g_guest_gpu_contended && xbox_MemoryGpuYieldAllowed()))
         || s_depth <= 0 || xbox_CurrentIrql() >= DISPATCH_LEVEL) return;
+    handoff=xbox_MemoryPrepareGpuYield(&ticket);
     depth = xbox_GuestSuspend();
-    SwitchToThread();
+    if(handoff)xbox_MemoryWaitGpu(ticket);
+    else SwitchToThread();
     xbox_GuestResume(depth);
 }
