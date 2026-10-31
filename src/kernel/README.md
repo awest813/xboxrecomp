@@ -1,5 +1,23 @@
 # xbox_kernel — Xbox Kernel Replacement Layer
 
+## Current implementation notes (2026-10-31)
+
+Export routing is not proof of behavioral completeness. Guest threads use
+thread-local registers/TIBs, a FIFO lifted-CPU gate and a separate RAM gate.
+Ordinary heap allocation/free/query and worker-stack bookkeeping are now
+serialized; RAM readers alone do not serialize allocator metadata. Passive
+critical-section contention releases CPU/RAM while blocking. The optional
+`RECOMP_CS_GUEST_FASTPATH=1` keeps uncontended Enter/Leave on the CPU; default
+off, with native coverage but no accepted MVP gameplay comparison.
+
+The separate contiguous graphics arena remains bump-only. Its free bridge
+currently reaches the ordinary heap table and does not reclaim graphics
+allocations. Repeated demo/loading cycles exposed exhaustion in MVP run184;
+this is open work. Contiguous/tiled views and low-RAM mirrors have different
+backing; do not conflate them. The tables/examples below are historical
+orientation, not a current line-count or acceptance inventory. See the
+[MVP handoff](../../mvp06/docs/HANDOFF.md) and [system audit](../../mvp06/docs/SYSTEM_PERFORMANCE_AUDIT184.md).
+
 Replaces all 371 Xbox kernel exports (347 function ordinals + 24 data exports) with Win32 equivalents. This is the foundation layer that every recompiled game needs — it provides memory layout, file I/O, threading, synchronization, and hardware abstraction.
 
 All 371 ordinals are routed: every export now has either a per-ordinal `bridge_*` wrapper (real implementation or a documented stub) or a kernel data export entry. Verified by `tools/kernel_audit/test_bridge_ordinals.py`, which cross-checks routing, argument sizes, and data exports against the reference export table.

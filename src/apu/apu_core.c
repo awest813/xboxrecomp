@@ -23,6 +23,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#include "platform/guest_memory.h"
 
 /* ============================================================
  * Globals
@@ -39,6 +40,33 @@ static APUMixerVoice g_mixer_voices[APU_MIXER_MAX_VOICES];
 static volatile int g_mixer_active_count = 0;
 static CRITICAL_SECTION g_mixer_cs;
 static bool g_mixer_initialized = false;
+/* Optional timing only; never change the producer's pacing or RAM leases. */
+static volatile LONG s_apu_timing_enabled=-1;
+static uint64_t s_apu_diag_blocks,s_apu_diag_resets,s_apu_diag_lost_us;
+static uint64_t s_apu_diag_late_max_us,s_apu_diag_throttle_us;
+static uint64_t s_apu_diag_ram_us,s_apu_diag_pipeline_us,s_apu_diag_frames;
+static uint64_t s_apu_diag_ram_max_us,s_apu_diag_pipeline_max_us,s_apu_diag_block_max_us;
+static uint64_t s_apu_diag_ram_bins[20],s_apu_diag_block_bins[20];
+static int64_t s_apu_diag_last_block_us;
+static uint32_t s_apu_diag_thread_id;
+static uint64_t s_apu_diag_off_frames,s_apu_diag_fe_stopped_frames,s_apu_diag_partial_blocks;
+static void apu_timing_bin(uint64_t bins[20],uint64_t us)
+{
+    unsigned bin=0;
+    while(us>1 && bin<19) { us>>=1;bin++; }
+    bins[bin]++;
+}
+static int apu_timing_enabled(void)
+{
+    if(s_apu_timing_enabled<0) {
+        const char *e=getenv("RECOMP_APU_TIMING");
+        InterlockedCompareExchange(&s_apu_timing_enabled,e && *e=='1',-1);
+    }
+    return s_apu_timing_enabled!=0;
+}
+#if defined(_WIN32)
+static bool g_timer_period_requested;
+#endif
 struct McpxApuDebug g_dbg;
 struct McpxApuDebug g_dbg_cache;
 int g_dbg_voice_monitor = -1;
@@ -55,8 +83,22 @@ void mcpx_debug_begin_frame(void) {}
 void mcpx_debug_end_frame(void) {}
 
 /* ============================================================
- * IRQ handling (stubbed - no PCI bus in standalone)
+ * IRQ handling: the APU's line goes to the kernel, which calls the title's
+ * connected ISR (DirectSound's, vector 0x35) from its timer thread.
+ *
+ * It used to go nowhere (the qemu_shim stub), so DirectSound's ISR never
+ * ran: packet completions, position notifications, voice-end and idle-voice
+ * traps were only noticed when some other path happened to look. MVP 06
+ * connects that ISR (KeConnectInterrupt vector 53) and its between-pitch
+ * flow waited 25-70 s, or forever. NFSU2's port fixed the same silence the
+ * same way. RECOMP_APU_IRQ=0 restores the old behaviour.
  * ============================================================ */
+
+extern void xbox_ApuInterruptLine(int level);
+#undef pci_irq_assert
+#undef pci_irq_deassert
+#define pci_irq_assert(dev)   xbox_ApuInterruptLine(1)
+#define pci_irq_deassert(dev) xbox_ApuInterruptLine(0)
 
 static void update_irq(MCPXAPUState *d)
 {
@@ -274,37 +316,66 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* The DSP accumulated eight 32-sample frames here. Preserve those samples
+     * and submit exactly 256 at this cadence. Clearing the buffer discarded
+     * hardware voices, while synthesizing 1024 samples every eight frames
+     * advanced software voices four times too fast. */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
-
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
+        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                               NV_PAPU_SECTL_XCNTMODE);
+        int hardware = xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF
+            && !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+            && !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        int submitted;
+        if(!hardware && d->monitor.frame_fresh_mask==0xff &&
+            !g_test_tone.active && !g_audio_muted && apu_timing_enabled()) {
+            unsigned i;
+            for(i=0;i<MIXER_FRAME_SAMPLES;i++) {
+                if(d->monitor.frame_buf[i][0] || d->monitor.frame_buf[i][1]) {
+                    s_apu_diag_partial_blocks++;
+                    break;
                 }
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        /* A running worker prepared all eight slices independently. A stop
+         * on the last slice must not erase earlier valid hardware output.
+         * Standalone/stale monitor calls still clear stopped hardware. */
+        if ((!hardware && d->monitor.frame_fresh_mask != 0xff) ||
+            g_test_tone.active || g_audio_muted)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
+            }
+        }
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
+        submitted = xa2_submit_samples((const int16_t *)d->monitor.frame_buf,
+                                       MIXER_FRAME_SAMPLES);
+        d->monitor.frame_fresh_mask = 0;
+        if (getenv("RECOMP_APU_TRACE")) {
+            static uint32_t last_ms, blocks, dropped, nonzero, peak;
+            uint32_t now = GetTickCount();
+            int i;
+            blocks++; dropped += !submitted;
+            for (i = 0; i < MIXER_FRAME_SAMPLES * 2; i++) {
+                int sample = ((const int16_t *)d->monitor.frame_buf)[i];
+                uint32_t magnitude = (uint32_t)(sample < 0 ? -sample : sample);
+                nonzero += sample != 0;
+                if (magnitude > peak) peak = magnitude;
+            }
+            if (now - last_ms >= 2000) {
+                fprintf(stderr, "[APUOUTPUT] blocks=%u frames=%u nonzero=%u peak=%u dropped=%u\n",
+                        blocks, blocks * MIXER_FRAME_SAMPLES, nonzero, peak, dropped);
+                blocks = dropped = nonzero = peak = 0; last_ms = now;
+            }
+        }
         return;
     }
 
@@ -372,7 +443,37 @@ static void throttle(MCPXAPUState *d)
         return;
     }
 
+#if defined(_WIN32)
+    if(xa2_is_active()) {
+        /* Pace the 256-frame producer by the device clock, as in nfsu2-sw.
+         * Resetting the wall deadline after one late block permanently lost
+         * scheduling/RAM stalls. The bounded queue instead allows a burst to
+         * catch up, keeping eight blocks ahead inside twelve owned slots. */
+        int timing=apu_timing_enabled();
+        int64_t start=qemu_clock_get_us(QEMU_CLOCK_REALTIME),elapsed;
+        /* Permit register writers once per block even when catching up and
+         * therefore never sleeping. No guest RAM lease is held in throttle. */
+        qemu_mutex_unlock(&d->lock);
+        SwitchToThread();
+        qemu_mutex_lock(&d->lock);
+        while(!d->pause_requested && xa2_queued()>=xa2_queue_target())
+            qemu_cond_timedwait(&d->cond,&d->lock,1);
+        elapsed=qemu_clock_get_us(QEMU_CLOCK_REALTIME)-start;
+        d->sleep_acc_us+=(int)elapsed;
+        if(timing) { s_apu_diag_blocks++;s_apu_diag_throttle_us+=(uint64_t)elapsed; }
+        return;
+    }
+#endif
+
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    int64_t wait_start_us=now_us,finished_us;
+    int timing=apu_timing_enabled();
+    if(timing) {
+        int64_t late=d->next_frame_time_us ? now_us-d->next_frame_time_us : 0;
+        s_apu_diag_blocks++;
+        if(late>0 && (uint64_t)late>s_apu_diag_late_max_us)s_apu_diag_late_max_us=(uint64_t)late;
+        if(late>EP_FRAME_US) { s_apu_diag_resets++;s_apu_diag_lost_us+=(uint64_t)late; }
+    }
 
     if (d->next_frame_time_us == 0 ||
         now_us - d->next_frame_time_us > EP_FRAME_US) {
@@ -390,7 +491,9 @@ static void throttle(MCPXAPUState *d)
     }
     d->next_frame_time_us += EP_FRAME_US;
 
-    d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
+    finished_us=qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    d->sleep_acc_us += (int)(finished_us - now_us);
+    if(timing)s_apu_diag_throttle_us+=(uint64_t)(finished_us-wait_start_us);
 }
 
 /* ============================================================
@@ -423,6 +526,51 @@ static void se_frame(MCPXAPUState *d)
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
 
+    /* A notifier write or idle-voice trap latched this frame: raise it now,
+     * or the trap halts the front end unseen. */
+    if (d->set_irq) {
+        d->set_irq = false;
+        update_irq(d);
+    }
+
+    /* A movie can wait on DirectSound's playback cursor after decoding its
+     * first frame. Trace voice progress at a bounded rate to distinguish
+     * that wait from a decoder or presentation failure. */
+    if (getenv("RECOMP_APU_TRACE")) {
+        static int64_t last_trace_ms;
+        if (now_ms - last_trace_ms >= 2000) {
+            unsigned v, active = 0, shown = 0;
+            last_trace_ms = now_ms;
+            hwaddr base = d->regs[NV_PAPU_VPVADDR];
+            for (v = 0; v < 256; v++)
+                active += !!(ldl_le_phys(address_space_memory,
+                    base + v * NV_PAVS_SIZE + NV_PAVS_VOICE_PAR_STATE)
+                    & NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+            fprintf(stderr, "[APUPROGRESS] frames/s=%d vaddr=%08X active=%u voices:",
+                    g_dbg.frames_processed, (uint32_t)base, active);
+            for (v = 0; v < 256 && shown < 8; v++) {
+                hwaddr voice = base + v * NV_PAVS_SIZE;
+                uint32_t state = ldl_le_phys(address_space_memory,
+                                            voice + NV_PAVS_VOICE_PAR_STATE);
+                uint32_t fmt;
+                if (!(state & NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) continue;
+                fmt = ldl_le_phys(address_space_memory, voice + NV_PAVS_VOICE_CFG_FMT);
+                fprintf(stderr, " %u:%X/%X@%X%s%s%s", v,
+                        ldl_le_phys(address_space_memory, voice + NV_PAVS_VOICE_PAR_OFFSET)
+                            & NV_PAVS_VOICE_PAR_OFFSET_CBO,
+                        ldl_le_phys(address_space_memory, voice + NV_PAVS_VOICE_PAR_NEXT)
+                            & NV_PAVS_VOICE_PAR_NEXT_EBO,
+                        ldl_le_phys(address_space_memory, voice + NV_PAVS_VOICE_CUR_PSL_START)
+                            & NV_PAVS_VOICE_CUR_PSL_START_BA,
+                        state & NV_PAVS_VOICE_PAR_STATE_PAUSED ? "(paused)" : "",
+                        fmt & NV_PAVS_VOICE_CFG_FMT_MULTIPASS ? "(mix)" : "",
+                        fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE ? "(stream)" : "");
+                shown++;
+            }
+            fputc('\n', stderr);
+        }
+    }
+
     d->ep_frame_div++;
 
     mcpx_debug_end_frame();
@@ -432,9 +580,39 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+static void apu_run_audio_frame(MCPXAPUState *d,int timing)
+{
+    unsigned slice=(unsigned)d->ep_frame_div%8;
+    if(!slice)d->monitor.frame_fresh_mask=0;
+    /* DSP/VP writes only this 32-frame slice. An inactive slice must be
+     * silent instead of replaying the same slice from the previous block. */
+    memset(&d->monitor.frame_buf[slice*NUM_SAMPLES_PER_FRAME],0,
+           NUM_SAMPLES_PER_FRAME*sizeof d->monitor.frame_buf[0]);
+    d->monitor.frame_fresh_mask|=(uint8_t)(1u<<slice);
+    int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                            NV_PAPU_SECTL_XCNTMODE);
+    uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+    bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                      !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
+                      !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+    if(timing) {
+        if(xcntmode==NV_PAPU_SECTL_XCNTMODE_OFF)s_apu_diag_off_frames++;
+        else if(!apu_active)s_apu_diag_fe_stopped_frames++;
+    }
+    if (apu_active && !g_test_tone.active) {
+        se_frame(d);
+    } else {
+        mcpx_apu_monitor_frame(d);
+        d->ep_frame_div++;
+    }
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(_WIN32)
+    if(apu_timing_enabled())s_apu_diag_thread_id=GetCurrentThreadId();
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -450,22 +628,37 @@ static void *mcpx_apu_frame_thread(void *arg)
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
-
-        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
-                                NV_PAPU_SECTL_XCNTMODE);
-        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
-
-        if (apu_active && !g_test_tone.active) {
-            /* Full pipeline: VP voices → DSP → monitor → waveOut */
-            se_frame(d);
-        } else {
-            /* Lightweight: just monitor frame (test tone + software mixer) */
-            mcpx_apu_monitor_frame(d);
-            d->ep_frame_div++;
+        int timing=apu_timing_enabled();
+        int64_t ram_start=timing?qemu_clock_get_us(QEMU_CLOCK_REALTIME):0;
+        xbox_MemoryEnter();
+        int64_t pipeline_start=timing?qemu_clock_get_us(QEMU_CLOCK_REALTIME):0;
+        if(timing) {
+            uint64_t ram_us=(uint64_t)(pipeline_start-ram_start);
+            s_apu_diag_ram_us+=ram_us;
+            if(ram_us>s_apu_diag_ram_max_us)s_apu_diag_ram_max_us=ram_us;
+            apu_timing_bin(s_apu_diag_ram_bins,ram_us);
         }
+
+        apu_run_audio_frame(d,timing);
+        if(timing) {
+            int64_t finished=qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            uint64_t pipeline_us=(uint64_t)(finished-pipeline_start);
+            s_apu_diag_pipeline_us+=pipeline_us;
+            if(pipeline_us>s_apu_diag_pipeline_max_us)s_apu_diag_pipeline_max_us=pipeline_us;
+            s_apu_diag_frames++;
+            /* At each 256-frame boundary, include throttling and all eight
+             * RAM acquisitions in the production interval. Reuse the end
+             * timestamp; default-off adds no clocks or histogram writes. */
+            if(!(d->ep_frame_div%8)) {
+                if(s_apu_diag_last_block_us) {
+                    uint64_t gap=(uint64_t)(finished-s_apu_diag_last_block_us);
+                    apu_timing_bin(s_apu_diag_block_bins,gap);
+                    if(gap>s_apu_diag_block_max_us)s_apu_diag_block_max_us=gap;
+                }
+                s_apu_diag_last_block_us=finished;
+            }
+        }
+        xbox_MemoryLeave();
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -522,6 +715,13 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
         return NULL;
     }
+
+#if defined(_WIN32)
+    /* The Windows timer default wakes the 5.333 ms audio batch late and
+     * slows the playback cursor used by movie/game timing. Match the
+     * Mercenaries runtime's 1 ms request and balance it on shutdown. */
+    g_timer_period_requested = timeBeginPeriod(1) == TIMERR_NOERROR;
+#endif
 
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
@@ -585,6 +785,12 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
 
     free(d);
     g_state = NULL;
+#if defined(_WIN32)
+    if (g_timer_period_requested) {
+        timeEndPeriod(1);
+        g_timer_period_requested = false;
+    }
+#endif
     fprintf(stderr, "[APU] Shutdown complete\n");
 }
 

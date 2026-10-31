@@ -8,14 +8,12 @@
  * HcRevision out of an aperture backed by zeroed RAM, concludes there is a
  * host controller with no root hub ports, and enumerates nothing.
  *
- * This is the register half of the answer: a controller that reports a real
- * revision, a root hub with ports, and the handful of registers that have
- * behaviour rather than storage. It does not yet walk the endpoint and
- * transfer descriptor lists, which is what actually moves a report, so a
- * driver that gets this far will find a port and then have nothing to talk to.
- * That is deliberate -- the register trace is what says whether the driver
- * polls HcInterruptStatus or waits on the IRQ, and that answers how much of
- * the rest is needed before any of it is written.
+ * The model supplies operational registers, root-hub connection/reset,
+ * control/bulk/periodic descriptor walks, HCCA completion queues and interrupt
+ * delivery. Queue bus addresses resolve into contiguous DMA backing, while
+ * static-image control reply buffers retain their virtual addresses. Completed
+ * lists remain driver-owned until WDH acknowledgment, and repeated acknowledged
+ * reports do not trip the stuck-interrupt guard.
  *
  * Written from the OHCI 1.0a specification and this title's own code.
  */

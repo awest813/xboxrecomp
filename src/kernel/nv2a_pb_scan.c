@@ -1,15 +1,9 @@
 /*
- * Read-only survey of the pushbuffer a title submits.
+ * Walk the NV2A pushbuffer, optionally surveying or executing its methods.
  *
- * The title builds NV2A commands in guest RAM and advances DMA_PUT; nothing
- * here executes them, so the framebuffer stays black however far the game
- * gets. Before any of that can be made to draw, the question is what it
- * actually asks for -- which methods, on which object classes, how many of
- * them -- because that is the difference between "the existing PGRAPH
- * translator nearly covers this" and "this needs a real one".
- *
- * Purely a reader: it walks the buffer and counts, and never writes to guest
- * memory or to the GPU state. Enabled with RECOMP_PB_SCAN.
+ * The title builds commands in guest RAM and advances DMA_PUT. RECOMP_PB_SCAN
+ * enables the method inventory; RECOMP_PB_EXEC invokes the software executor
+ * and publishes DMA_GET after consumed work. Both use the same command walk.
  *
  * Pushbuffer encoding (NV20/NV2A), one dword per command header:
  *   (w & 0xE0030003) == 0x00000000  increasing methods
@@ -25,6 +19,10 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include "nv2a_pb_scan.h"
+#include "nv2a_render.h"
+#include "platform/xbox_winnt.h"
+#include "platform/guest_memory.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -44,14 +42,16 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
+/* Method inventory runs on every parameter. Match the reference's constant
+ * time index rather than searching thousands of pairs for each vertex word. */
+static uint16_t s_seen_slot[8][0x2000 / 4];
 
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
-            return;
-        }
+    uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
+    if (*slot) {
+        s_seen[*slot - 1].count++;
+        return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -69,6 +69,7 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
+        *slot = (uint16_t)s_seen_count;
     }
 }
 
@@ -144,55 +145,164 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
-{
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = start_va;
-    uint32_t words = 0, jumps = 0, unknown = 0;
+/* Physical GET follows the command stream, including ring jumps and the
+ * NV2A's single subroutine level. The old previous-PUT..new-PUT survey skipped
+ * CALL bodies, stopped at JUMPs and discarded every wrapped submission.
+ * This follows the reference walker, retaining partial method packets too. */
+#define PB_PHYS_MASK 0x0FFFFFFCu
+#define PB_RAM_BYTES (64u * 1024u * 1024u)
+static uint32_t s_get = 0xFFFFFFFFu, s_ret;
+static uint32_t s_method, s_subch, s_remaining;
+static uint32_t s_walk_words,s_unknown_run,s_budget_put=0xFFFFFFFFu;
+static uint64_t s_slice_words,s_slice_time,s_slice_software,s_slice_put;
+static int s_in_call, s_noninc;
+extern void xbox_Nv2aDmaGet(uint32_t get_phys);
 
+void nv2a_pb_resync(uint32_t get_phys)
+{
+    xbox_MemoryTrace(XBOX_TRACE_RESYNC,get_phys,s_get,s_remaining,s_ret);
+    s_get = get_phys & PB_PHYS_MASK;
+    s_in_call = 0;
+    s_remaining = 0;
+    s_walk_words=s_unknown_run=0;
+    s_budget_put=0xFFFFFFFFu;
+}
+
+static void pb_lost_sync(uint32_t at, uint32_t word, uint32_t put)
+{
+    static unsigned errors;
+    if (++errors <= 16 || errors % 100 == 0)
+        fprintf(stderr, "  [PB] lost sync #%u at %08X word %08X PUT %08X; resync\n",
+                errors, at, word, put);
+    nv2a_pb_resync(put);
+}
+
+uint32_t nv2a_pb_scan_slice(uint32_t put_phys,uint32_t max_words,
+                          uint32_t max_ms,int stop_software,int *software)
+{
+    uintptr_t ram = (uintptr_t)xbox_GetMemoryOffset() + 0x80000000u;
+    uint32_t put = put_phys & PB_PHYS_MASK;
+    uint32_t words = 0, jumps = 0, unknown = 0;
+    ULONGLONG start=GetTickCount64();
+    if(software)*software=0;
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
-        return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
-
-    while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
-        va += 4;
-        words++;
-
-        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
-            jumps++;
-            break;                            /* a jump ends this segment */
-        }
-        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
-            continue;
-        if ((w & 0x00030003u) == 0u) {
-            uint32_t count  = (w >> 18) & 0x7FFu;
-            uint32_t subch  = (w >> 13) & 7u;
-            uint32_t method =  w & 0x1FFCu;
-            int noninc = (w & 0xE0000000u) == 0x40000000u;
-
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
-                uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
-                /* Same walk, two consumers: the survey counts, the executor
-                 * acts. Keeping them on one decode means they can never
-                 * disagree about what the stream said. */
-                if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
-                va += 4;
-                words++;
-            }
-            continue;
-        }
-        unknown++;
+    if (!(s_exec_enabled || getenv("RECOMP_PB_SCAN")))
+        return put;
+    if (s_get == 0xFFFFFFFFu)
+        nv2a_pb_resync(put);
+    if (put >= PB_RAM_BYTES)
+        return s_get;
+    /* Bound a walk toward a stationary submission, not the lifetime of a
+     * continuously busy ring. With sliced execution PUT can advance before
+     * GET ever catches it; carrying the budget across those submissions
+     * eventually skips valid fences and software wake-up methods. */
+    if(s_budget_put!=put) {
+        s_budget_put=put;
+        s_walk_words=0;
     }
 
+    while (s_get != put) {
+        uint32_t at = s_get, word, target;
+        if(words>=max_words) { s_slice_words++;break; }
+        if(max_ms && words && GetTickCount64()-start>=max_ms) { s_slice_time++;break; }
+        /* Report only executed work. The producer can reuse everything before
+         * GET, so publishing PUT before executing let it overwrite commands. */
+        if (s_exec_enabled)
+            xbox_Nv2aDmaGet(s_get);
+        if (s_get >= PB_RAM_BYTES || s_walk_words>=0x400000u) {
+            pb_lost_sync(at, 0, put);
+            break;
+        }
+        if(s_exec_enabled)nv2a_render_memory_read((const void *)(ram+s_get),4);
+        word = *(const uint32_t *)(ram + s_get);
+        if(stop_software && s_remaining && s_subch==0 && s_method==0x100 && word) {
+            s_slice_software++;
+            if(software)*software=1;
+            break;
+        }
+        words++;
+        s_walk_words++;
+        s_get += 4;
+        if (s_remaining) {
+            note(s_subch, s_method);
+            if(s_exec_enabled && ((s_subch==0 && (s_method==0x100 || s_method==0x1D70))
+                                 || (s_subch!=0 && s_method==0x310)))
+                xbox_MemoryTrace(XBOX_TRACE_METHOD,at,(s_subch<<16)|s_method,word,put);
+            if (s_exec_enabled)
+                nv2a_pb_exec_method(s_subch, s_method, word);
+            if(s_exec_enabled && ((s_subch==0 && (s_method==0x100 || s_method==0x1D70))
+                                 || (s_subch!=0 && s_method==0x310)))
+                xbox_MemoryTrace(XBOX_TRACE_METHOD_DONE,at,(s_subch<<16)|s_method,word,put);
+            if (!s_noninc)
+                s_method += 4;
+            s_remaining--;
+            continue;
+        }
+        if ((word & 0xE0000003u) == 0x20000000u || (word & 3u) == 1u) {
+            target = (word & 3u) == 1u ? word & 0xFFFFFFFCu
+                                                  : word & 0x1FFFFFFCu;
+            if (target >= PB_RAM_BYTES) {
+                pb_lost_sync(at, word, put);
+                break;
+            }
+            s_get = target;
+            jumps++;
+        } else if ((word & 3u) == 2u) {
+            target = word & 0xFFFFFFFCu;
+            if (target >= PB_RAM_BYTES || s_in_call) {
+                pb_lost_sync(at, word, put);
+                break;
+            }
+            s_ret = s_get;
+            s_in_call = 1;
+            s_get = target;
+        } else if ((word & 0xFFFF0003u) == 0x00020000u) {
+            if (!s_in_call) {
+                pb_lost_sync(at, word, put);
+                break;
+            }
+            s_get = s_ret;
+            s_in_call = 0;
+        } else if ((word & 0xE0030003u) == 0u
+                   || (word & 0xE0030003u) == 0x40000000u) {
+            s_remaining = (word >> 18) & 0x7FFu;
+            s_subch = (word >> 13) & 7u;
+            s_method = word & 0x1FFCu;
+            s_noninc = (word & 0x40000000u) != 0;
+            s_unknown_run = 0;
+        } else {
+            unknown++;
+            if (++s_unknown_run > 64) {
+                pb_lost_sync(at, word, put);
+                break;
+            }
+        }
+    }
+    if (s_exec_enabled)
+        xbox_Nv2aDmaGet(s_get);
+    if(s_get==put) {
+        s_walk_words=s_unknown_run=0;s_slice_put++;
+        /* A failed exclusive try may have finished through synchronous
+         * fallback. No pending work remains to satisfy that advisory request.
+         * An owned scope still commits before releasing RAM exclusion. */
+        xbox_MemoryGpuIdle();
+    }
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+    return s_get;
+}
+
+uint32_t nv2a_pb_scan(uint32_t put_phys)
+{
+    uint32_t get=nv2a_pb_scan_slice(put_phys,0x400000u,0,0,NULL);
+    if((put_phys&PB_PHYS_MASK)<PB_RAM_BYTES && get!=(put_phys&PB_PHYS_MASK)) {
+        /* Preserve the original runaway-ring recovery for unbounded callers. */
+        pb_lost_sync(get,0,put_phys&PB_PHYS_MASK);
+        get=s_get;
+        if(s_exec_enabled)xbox_Nv2aDmaGet(get);
+    }
+    return get;
 }

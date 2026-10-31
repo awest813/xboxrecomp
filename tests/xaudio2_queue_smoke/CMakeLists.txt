@@ -1,0 +1,3 @@
+add_executable(xaudio2_queue_smoke main.c)
+target_link_libraries(xaudio2_queue_smoke PRIVATE platform xaudio2_8 ole32)
+target_compile_definitions(xaudio2_queue_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)

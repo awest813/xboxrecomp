@@ -14,6 +14,11 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "nv2a_pb_scan.h"
+#include "nv2a_ack.h"
+#include "nv2a_render.h"
+#include "platform/guest_memory.h"
+#include "platform/host_clock.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,65 +159,8 @@ static size_t xbox_TiledApertureSize(void)
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
-/*
- * NV2A busy-bit acknowledgement.
- *
- * D3D8 talks to the GPU through set-a-bit / wait-for-hardware-to-clear-it
- * handshakes. Against plain RAM the bit is set and nothing ever clears it, so
- * the title spins forever. Halo hangs in the push-buffer kick at 0x001EF930:
- *
- *     mov  [eax+0x100410], edx     ; set 0x10000
- *   L: test [eax+0x100410], 0x10000
- *     jne  L                       ; wait for the GPU
- *
- * Clearing those bits from a thread is not a hack around the handshake, it is
- * the handshake: on hardware the GPU clears them asynchronously, which is
- * exactly what this does. Work that would have been submitted is being done by
- * the D3D11 layer instead, so acknowledging immediately is honest.
- *
- * Only registers listed here are touched. Blanket-zeroing the aperture would
- * also wipe registers holding real state.
- *
- * ponytail: table-driven, extend as more handshakes turn up. A spin on a bit
- * that is not listed still hangs -- run the title and the watchdog sample will
- * name the register.
- */
-static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
-    { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
-
-    /* Interrupt status registers. These are write-1-to-clear on hardware, so
-     * an ISR "clearing" one writes the pending bit back -- against plain RAM
-     * that sets it instead, the interrupt stays pending forever, and the
-     * service routine re-enters until the stack is gone. Halo dies exactly
-     * that way: CMiniport::ServiceGrInterrupt writes 0x1000 to PGRAPH_INTR to
-     * acknowledge, reads it back still pending, and recurses into a native
-     * stack overflow.
-     *
-     * Holding them at zero is correct rather than convenient: nothing here
-     * ever raises a GPU interrupt, so "none pending" is the truth. */
-    { 0x000100, 0xFFFFFFFFu },  /* PMC_INTR_0    */
-    { 0x001100, 0xFFFFFFFFu },  /* PBUS_INTR_0   */
-    { 0x002100, 0xFFFFFFFFu },  /* PFIFO_INTR_0  */
-    { 0x400100, 0xFFFFFFFFu },  /* PGRAPH_INTR   */
-    { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
-};
-
-/*
- * Bits that must always read as SET. The mirror image of the table above:
- * where an interrupt-pending bit is false because nothing raises interrupts,
- * a queue-empty bit is true because nothing is queued.
- *
- * Halo's CMiniport::TilingUpdateIdle spins until the PFIFO caches report
- * empty (0x001F5CD1). Zeroed RAM says "not empty" forever, so tile setup
- * during CDevice::InitializeFrameBuffers never completes.
- *
- * Note 0x003220 is deliberately absent -- that one exits on the bit being
- * CLEAR, which zeroed memory already gives.
- */
-static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
-    { 0x002400, 0x00000010u },  /* PFIFO_RUNOUT_STATUS  LOW_MARK (empty) */
-    { 0x003214, 0x00000010u },  /* PFIFO_CACHE1_STATUS  LOW_MARK (empty) */
-};
+/* Busy/idle register semantics live in nv2a_ack.c. Their worker is separate
+ * from rendering: a PFB write-combine flush is not a GPU completion fence. */
 
 /*
  * PFIFO channel DMA pointers. Software writes DMA_PUT and spins until the GPU
@@ -239,6 +187,13 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  */
 #define NV2A_USER_DMA_PUT 0x800040u
 #define NV2A_USER_DMA_GET 0x800044u
+
+/* The walker publishes only commands it has consumed. Keeping this bus write
+ * outside the parser also lets its native regression use ordinary RAM. */
+void xbox_Nv2aDmaGet(uint32_t get_phys)
+{
+    *(volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_GET) = get_phys;
+}
 
 /*
  * The same channel's pointers on the PFIFO side of the aperture.
@@ -656,8 +611,33 @@ static void frame_counters_tick(void)
     }
 }
 
-static void fence_mirrors_tick(void)
+void xbox_Nv2aPatternColor(uint32_t value)
 {
+    if (g_nv2a_memory)
+        *(volatile uint32_t *)((uint8_t *)g_nv2a_memory+0x400B10)=value;
+}
+
+void xbox_Nv2aSemaphoreRelease(uint32_t value)
+{
+    /* The registered device chain names the semaphore itself. As in NFSU2,
+     * SET_SEMAPHORE_OFFSET is not added to that already resolved target. */
+    for (int i=0; i<g_fence_mirror_count; i++) {
+        uint32_t dev, target;
+        if (!fence_readable(g_fence_mirrors[i].device_ptr_va,4)) continue;
+        dev=*(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va+g_memory_offset);
+        if (!fence_readable(dev+g_fence_mirrors[i].get_ptr_off,4)) continue;
+        target=*(volatile uint32_t *)((uintptr_t)(dev+g_fence_mirrors[i].get_ptr_off)+g_memory_offset);
+        if (fence_readable(target,4))
+            *(volatile uint32_t *)((uintptr_t)target+g_memory_offset)=value;
+    }
+}
+
+static void fence_mirrors_tick(int executing)
+{
+    /* With real command execution, only a consumed semaphore release may
+     * retire a fence. Mirroring the producer here can run two fences ahead
+     * of PGRAPH's pattern marker and make D3D's progress comparison spin. */
+    if (executing) return;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -685,6 +665,11 @@ static void fence_mirrors_tick(void)
 }
 
 static int s_nv2a_trace = 0;
+/* Short synchronous progress retries grouping without waiting for exclusion.
+ * The 512-word default passed same-process reverse timing and two pitches.
+ * Exclusive scopes and software-interrupt publication keep their budgets. */
+enum { GPU_FALLBACK_WORDS = 512 };
+static volatile uint32_t s_gpu_fallback_words = GPU_FALLBACK_WORDS;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -744,34 +729,26 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+volatile uint64_t g_nv2a_idle_ticks;
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    const int exec = getenv("RECOMP_PB_EXEC") != NULL;
+    const int scan = getenv("RECOMP_PB_SCAN") != NULL;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
-            }
-        }
-        for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
-            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
-                *r |= NV2A_IDLE[i].idle_mask;
-            }
-        }
+        /* Also tick here as a fallback if the independent flag worker could
+         * not start. Atomic masked updates tolerate both workers. */
+        nv2a_ack_tick(regs);
         {
             volatile uint32_t *put =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             volatile uint32_t *get =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            if (*get != *put) {
+            if (!exec && !scan && *get != *put) {
                 *get = *put;
             }
         }
-        fence_mirrors_tick();
+        fence_mirrors_tick(exec);
         counter_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
@@ -796,12 +773,30 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t last_put;
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            if (put != last_put || (now_ms - last_put_ms) > 2000) {
+            uint32_t observed_get=*(volatile uint32_t *)((char *)regs+NV2A_USER_DMA_GET);
+            /* RECOMP_EXEC_TIMING: time this worker spends with nothing
+             * submitted (GET == PUT, PUT unchanged) -- waiting on the guest. */
+            {
+                static int timing = -1;
+                static LARGE_INTEGER idle_since;
+                if (timing < 0) { const char *e = getenv("RECOMP_EXEC_TIMING"); timing = e && *e == '1'; }
+                if (timing) {
+                    LARGE_INTEGER t;
+                    QueryPerformanceCounter(&t);
+                    if (put == last_put && observed_get == put) {
+                        if (idle_since.QuadPart) g_nv2a_idle_ticks += (uint64_t)(t.QuadPart - idle_since.QuadPart);
+                        idle_since = t;
+                    } else
+                        idle_since.QuadPart = 0;
+                }
+            }
+            if (put != last_put || observed_get != put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
-                    extern void nv2a_pb_scan(uint32_t, uint32_t);
-                    extern void nv2a_pb_scan_report(void);
                     static DWORD last_report;
+                    static uint32_t get_written = 0xFFFFFFFFu;
+                    uint32_t get_now = *(volatile uint32_t *)
+                                      ((char *)regs + NV2A_USER_DMA_GET);
 
                     /* DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
                      * `VA & 0x0FFFFFFF` and reads the GPU's position back as
@@ -817,9 +812,46 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    if (last_put && put > last_put)
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                    /* D3D can reset GET/PUT together. Otherwise the walker
+                     * owns GET, follows ring wraps and calls, and retains
+                     * packet state between submissions. */
+                    if (get_written == 0xFFFFFFFFu || get_now != get_written)
+                        nv2a_pb_resync(get_now);
+                    if(exec && nv2a_render_enabled() && xbox_MemoryTryGpu()) {
+                        static uint64_t scopes, fallback_scopes;
+                        int software=0;
+                        xbox_MemoryTrace(XBOX_TRACE_SCOPE,get_now,put,0,0);
+                        if(nv2a_render_begin()) {
+                            get_written=nv2a_pb_scan_slice(put,4096,2,1,&software);
+                            /* end commits before exclusion is released. */
+                            if(!nv2a_render_end())abort();
+                            scopes++;
+                        } else {
+                            get_written=nv2a_pb_scan_slice(put,4096,2,1,&software);
+                            fallback_scopes++;
+                        }
+                        xbox_MemoryEndGpu();
+                        xbox_MemoryTrace(XBOX_TRACE_SCOPE_END,get_written,put,software,0);
+                        /* A software trap waits for guest ISR/DPC code. That
+                         * code needs RAM: consume its parameter only after
+                         * all queued pixels are committed and exclusion ends. */
+                        if(software)get_written=nv2a_pb_scan_slice(put,1,0,0,NULL);
+                        if(scopes==1 || (scopes && !(scopes%10000)))
+                            fprintf(stderr,"[D3D11] RAM scopes=%llu init-fallback=%llu\n",
+                                (unsigned long long)scopes,(unsigned long long)fallback_scopes);
+                    } else {
+                        /* Never wait on a CPU polling GPU completion. When
+                         * scopes are enabled, retry exclusion between bounded
+                         * synchronous slices as the guest releases RAM. */
+                        if(exec && xbox_MemoryGateEnabled()) {
+                            uint32_t words=s_gpu_fallback_words;
+                            if(words<64 || words>4096)words=GPU_FALLBACK_WORDS;
+                            get_written=nv2a_pb_scan_slice(put,words,2,0,NULL);
+                        }
+                        else get_written=nv2a_pb_scan(put);
+                    }
+                    if (!exec)
+                        xbox_Nv2aDmaGet(get_written);
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
@@ -866,28 +898,49 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
 
-        /* Advance KeTickCount. It was written once at init and left frozen,
-         * which silently breaks every timeout that polls it: Halo's DHCP setup
-         * waits on a tick deadline that never arrives and spins forever bringing
-         * up XNet. A live clock is also just the truth -- KeTickCount ticks on
-         * hardware whether or not anyone is asleep. GetTickCount() shares the
-         * millisecond unit, so the rate matches. */
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
-
         Sleep(0);  /* yield; the waiter is spinning on another core */
+    }
+    return 0;
+}
+
+/* Advance KeTickCount every millisecond, on its own thread.
+ *
+ * It was written once at init and left frozen, which silently breaks every
+ * timeout that polls it: Halo's DHCP setup waits on a tick deadline that never
+ * arrives and spins forever bringing up XNet. It then lived at the bottom of
+ * the NV2A acknowledgement loop above, which stalls behind pushbuffer slices,
+ * software-method traps and renderer work, so the console's 1 ms clock moved
+ * in frame-sized jumps and stopped during traps -- XAPI GetTickCount and EA's
+ * audio scheduling read it (NFSU2's and SSX's ports found the same freeze).
+ * Millisecond resolution from the host performance counter (host_clock.h). */
+static DWORD WINAPI xbox_tick_count_thread(LPVOID unused)
+{
+    volatile uint32_t *tick = (volatile uint32_t *)
+        ((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) + g_memory_offset);
+    (void)unused;
+    while (!g_nv2a_ack_stop) {
+        *tick = (uint32_t)xbox_HostMilliseconds();
+        Sleep(1);
     }
     return 0;
 }
 
 static void xbox_Nv2aAckStart(void)
 {
+    {
+        HANDLE tick = CreateThread(NULL, 0, xbox_tick_count_thread, NULL, 0, NULL);
+        if (tick) {
+            SetThreadPriority(tick, THREAD_PRIORITY_TIME_CRITICAL);
+            CloseHandle(tick);
+        }
+    }
     g_nv2a_ack_stop = 0;
+    if (!nv2a_ack_start(g_nv2a_memory))
+        fprintf(stderr, "  WARNING: independent NV2A flag worker unavailable\n");
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
-        fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
-                sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
+        fprintf(stderr, "  NV2A command and flag workers started\n");
     }
 }
 
@@ -1705,6 +1758,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         MEM32_INIT(XBOX_FS_BASE + 0x04, XBOX_STACK_TOP);   /* Stack base (high address) */
         MEM32_INIT(XBOX_FS_BASE + 0x08, XBOX_STACK_BASE);  /* Stack limit (low address) */
         MEM32_INIT(XBOX_FS_BASE + 0x18, XBOX_FS_BASE);     /* Self pointer */
+        *(uint8_t *)XBOX_VA(XBOX_FS_BASE + 0x24) = 0;    /* KPCR.Irql */
 
         /*
          * fs:[0x20] - On Xbox KPCR, this is the Prcb pointer.
@@ -1879,11 +1933,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
-        /* The pushbuffer survey rides on the same poll, so either
-         * variable arms it. */
+        /* Execution has its own enable check in the poll. It must not imply
+         * verbose per-submission logging: those writes serialize GPU work
+         * and perturb RAM-scope scheduling. Survey/explicit trace still log. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                    || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+                    || getenv("RECOMP_PB_SCAN") != NULL;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
@@ -1971,6 +2025,21 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
+                /* GP/EP DSP data memory is plain RAM on hardware: above the
+                 * 256-voice register block (256 * 0x300 == 0x30000) the
+                 * aperture is data DirectSound block-copies through (MVP 06
+                 * memmoves GP memory at 0xFE830200 during voice setup). The
+                 * single-instruction MMIO hook cannot emulate a bulk copy,
+                 * so those faults are fatal rather than serviced; keep the
+                 * data span readable/writable and only the register block
+                 * trapped. Same shape as burnout3's fix/apu-dsp-memory-
+                 * untrapped. */
+                if (g_apu_mmio_trapped) {
+                    DWORD op2;
+                    VirtualProtect((char *)g_mcpx_memory + 0x00030000,
+                                   0x00080000u - 0x00030000,
+                                   PAGE_READWRITE, &op2);
+                }
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
@@ -2210,6 +2279,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    /* GPU residency protects surface pages in both views of the window. */
+    nv2a_render_set_window(g_contig_memory, g_tiled_view, xbox_GetTiledAliasBytes());
+    xbox_MemorySetHostAccessHook(nv2a_render_host_access);
+
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
@@ -2245,15 +2318,19 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
+    nv2a_ack_request_stop(); /* cancel a pending software-method wait before join */
+    if (g_nv2a_ack_thread) {
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        /* It can still be inside a long renderer batch. Join before freeing
+         * either its MMIO aperture, guest RAM or KeTickCount backing. */
+        WaitForSingleObject(g_nv2a_ack_thread, INFINITE);
+        CloseHandle(g_nv2a_ack_thread);
+        g_nv2a_ack_thread = NULL;
+    }
+    nv2a_ack_stop();
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
-    }
-    if (g_nv2a_ack_thread) {
-        InterlockedExchange(&g_nv2a_ack_stop, 1);
-        WaitForSingleObject(g_nv2a_ack_thread, 1000);
-        CloseHandle(g_nv2a_ack_thread);
-        g_nv2a_ack_thread = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
@@ -2367,12 +2444,34 @@ ptrdiff_t xbox_GetMemoryOffset(void)
     return g_memory_offset;
 }
 
+/* Bytes of the contiguous window that the tiled aperture aliases (0 when the
+ * alias view is absent). Page-protection users must apply every change to
+ * both views: a protection is a property of the view, not of the storage. */
+size_t xbox_GetTiledAliasBytes(void)
+{
+    size_t bytes = xbox_TiledApertureSize();
+    if (!g_tiled_view)
+        return 0;
+    return bytes > XBOX_CONTIG_SIZE ? XBOX_CONTIG_SIZE : bytes;
+}
+
+/* Contiguous window storage, or NULL when it could not be mapped. */
+void *xbox_GetContigMemory(void)
+{
+    return g_contig_memory;
+}
+
 /* ── Dynamic heap allocator ────────────────────────────────
  *
  * Simple bump allocator for MmAllocateContiguousMemory and similar.
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
- * No free support (bump-only for now).
+ * Freed blocks are reused before advancing the bump pointer.
  */
+/* The RAM gate excludes device writes, but permits concurrent host readers.
+ * Thread startup allocates TLS outside the lifted CPU lock, so that lock also
+ * cannot protect this table. Keep selection, zero-fill and publication under
+ * one allocator lock to prevent live TIBs overlapping ordinary allocations. */
+static SRWLOCK g_heap_lock = SRWLOCK_INIT;
 static uint32_t g_heap_next = XBOX_HEAP_BASE;
 
 static int g_heap_alloc_count = 0;
@@ -2401,6 +2500,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 #define XBOX_MAX_THREAD_STACKS  8
 
 static int g_thread_stacks_used = 0;
+static SRWLOCK g_thread_stack_lock = SRWLOCK_INIT;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -2419,7 +2519,7 @@ static int g_thread_stacks_used = 0;
  * with the image's initialised thread-local data rather than zeros, and its
  * own per-thread structure behind slot 0.
  */
-uint32_t xbox_AllocThreadTib(void)
+static uint32_t alloc_thread_tib(void)
 {
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
@@ -2443,6 +2543,7 @@ uint32_t xbox_AllocThreadTib(void)
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
 
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
+    *(uint8_t *)TIB_VA(tib + 0x24) = 0;            /* new thread is passive */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
 
@@ -2450,11 +2551,22 @@ uint32_t xbox_AllocThreadTib(void)
     #undef TIB_VA
 }
 
+uint32_t xbox_AllocThreadTib(void)
+{
+    uint32_t tib;
+    xbox_MemoryEnter();
+    tib=alloc_thread_tib();
+    xbox_MemoryLeave();
+    return tib;
+}
+
 uint32_t xbox_AllocThreadStack(void)
 {
     uint32_t base;
 
+    AcquireSRWLockExclusive(&g_thread_stack_lock);
     if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
+        ReleaseSRWLockExclusive(&g_thread_stack_lock);
         return 0;
     }
 
@@ -2473,9 +2585,12 @@ uint32_t xbox_AllocThreadStack(void)
      * for small ones.
      */
     base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
-    if (!base)
+    if (!base) {
+        ReleaseSRWLockExclusive(&g_thread_stack_lock);
         return 0;
+    }
     g_thread_stacks_used++;
+    ReleaseSRWLockExclusive(&g_thread_stack_lock);
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
@@ -2499,12 +2614,16 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 {
     if (!stack_top)
         return;
+    xbox_MemoryEnter();
+    AcquireSRWLockExclusive(&g_thread_stack_lock);
     xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
     if (g_thread_stacks_used > 0)
         g_thread_stacks_used--;
+    ReleaseSRWLockExclusive(&g_thread_stack_lock);
+    xbox_MemoryLeave();
 }
 
-/* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
+/* Allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
  *
  * MmAllocateContiguousMemory hands back physical memory, and on Xbox physical
  * page P is visible at 0x80000000 + P. Drivers rely on that being an exact
@@ -2518,45 +2637,245 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  *
  * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
  * the GPU-instance bridge, so the two do not meet until the window is full.
- * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+ *
+ * Blocks are freed and reused. It was bump-only on the theory that
+ * contiguous blocks are framebuffers and pushbuffers a title allocates once,
+ * but MVP 06 allocates and frees textures, vertex buffers and movie surfaces
+ * here on every demo and load: after a few idle-demo/frontend cycles the 64 MB
+ * window was exhausted (66,960,000 bytes "used"), D3D got NULL for a 1.2 MB
+ * buffer during exhibition loading, and the game crashed on a poison pointer.
+ * MmFreeContiguousMemory went to the ordinary heap's table, which never held
+ * these blocks, so nothing came back.
+ *
+ * The bump pointer still only grows: xbox_ContiguousAllocatedBytes is a
+ * high-water mark that device models use to decide whether a physical offset
+ * names window memory, and an address that was ever handed out stays valid
+ * window memory. Freed blocks are reused first-fit, page granular, and
+ * coalesced with free neighbours.
+ *
+ * The first 64 KB of the window stay reserved. On hardware that is the
+ * kernel's low page (real-mode IVT, kernel start) and no title memory lands
+ * there; here the fake kernel PE sits at 0x80010000 and XPP builds its
+ * device-enum descriptors at the window base regardless. MVP 06's EA bucket
+ * heap was the first contiguous allocation and landed exactly on those
+ * descriptors -- its free-list heads then walked XPP's "RAM" string as block
+ * headers and crashed on 0xCCCCCCCC poison. Skipping the low 64 KB matches
+ * the hardware convention that nothing ordinary lives at physical zero.
+ *
+ * Pinned-address requests (MmAllocateContiguousMemoryEx with a one-block
+ * range) do not come from here and are not in the table, so freeing one is
+ * ignored, as before. */
+#define XBOX_CONTIG_LOW_RESERVE 0x10000u
+#define XBOX_CONTIG_MAX_BLOCKS 8192
+static SRWLOCK g_contig_lock = SRWLOCK_INIT;
+static volatile uint32_t g_contig_next = XBOX_CONTIG_BASE + XBOX_CONTIG_LOW_RESERVE;
+/* Address order. Bump allocations append; splitting a free block inserts. */
+static struct { uint32_t addr; uint32_t size; uint8_t free; }
+    g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
+static int g_contig_block_count = 0;
+static uint32_t g_contig_live_bytes = 0;
+static unsigned g_contig_log = 0;   /* first operations go to the run log */
+
+static void contig_insert(int at, uint32_t addr, uint32_t size, int free)
+{
+    memmove(&g_contig_blocks[at + 1], &g_contig_blocks[at],
+            (size_t)(g_contig_block_count - at) * sizeof g_contig_blocks[0]);
+    g_contig_blocks[at].addr = addr;
+    g_contig_blocks[at].size = size;
+    g_contig_blocks[at].free = (uint8_t)free;
+    g_contig_block_count++;
+}
+
+static void contig_remove(int at)
+{
+    g_contig_block_count--;
+    memmove(&g_contig_blocks[at], &g_contig_blocks[at + 1],
+            (size_t)(g_contig_block_count - at) * sizeof g_contig_blocks[0]);
+}
+
+/* Carve [addr,addr+size) out of free block i. Returns 0 if the table cannot
+ * hold the split. */
+static int contig_carve(int i, uint32_t addr, uint32_t size)
+{
+    uint32_t lo = g_contig_blocks[i].addr;
+    uint32_t hi = lo + g_contig_blocks[i].size;
+    int extra = (addr > lo) + (addr + size < hi);
+    if (g_contig_block_count + extra > XBOX_CONTIG_MAX_BLOCKS)
+        return 0;
+    if (addr > lo) {
+        g_contig_blocks[i].size = addr - lo;            /* free prefix */
+        contig_insert(++i, addr, size, 0);
+    } else {
+        g_contig_blocks[i].size = size;
+        g_contig_blocks[i].free = 0;
+    }
+    if (addr + size < hi)
+        contig_insert(i + 1, addr + size, hi - (addr + size), 1);
+    return 1;
+}
+
+static uint32_t contig_take(uint32_t size, uint32_t alignment)
+{
+    uint32_t result, next;
+    int i;
+
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t lo = g_contig_blocks[i].addr, hi;
+        if (!g_contig_blocks[i].free)
+            continue;
+        hi = lo + g_contig_blocks[i].size;
+        result = (lo + alignment - 1) & ~(alignment - 1);
+        if (result < lo || (uint64_t)result + size > hi)
+            continue;
+        if (!contig_carve(i, result, size))
+            break;
+        return result;
+    }
+
+    next = g_contig_next;
+    result = (next + alignment - 1) & ~(alignment - 1);
+    /* Leave the top of the window for GPU instance memory. */
+    if ((uint64_t)result + size >
+            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
+                - XBOX_GPU_INSTANCE_DEFAULT)
+        return 0;
+    if (g_contig_block_count + 1 > XBOX_CONTIG_MAX_BLOCKS)
+        return 0;
+    /* An alignment gap is deliberately not made reusable. Until a title
+     * frees something, addresses must match the old bump order exactly:
+     * device models key on them (MVP 06's DSP doorbells sit at fixed
+     * offsets in its contiguous DSound heap, RECOMP_APU_DSP_ACK), and
+     * filling a gap with a later small block moved that heap and left the
+     * title waiting forever on an unacknowledged DSP command. */
+    contig_insert(g_contig_block_count, result, size, 0);
+    g_contig_next = result + size;
+    return result;
+}
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
+    void *host;
 
     if (alignment < 4096) alignment = 4096;
-    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
+    if (alignment & (alignment - 1)) return 0;
+    if (!size) size = 1;
+    if (size > XBOX_CONTIG_SIZE) return 0;
+    size = (size + 4095u) & ~4095u;
 
-    /* Leave the top of the window for GPU instance memory. */
-    if ((uint64_t)result + size >
-            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
-                - XBOX_GPU_INSTANCE_DEFAULT) {
-        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
-                size, g_contig_next - XBOX_CONTIG_BASE,
-                (unsigned)XBOX_CONTIG_SIZE);
+    AcquireSRWLockExclusive(&g_contig_lock);
+    result = contig_take(size, alignment);
+    if (result)
+        g_contig_live_bytes += size;
+    if (++g_contig_log <= 48) {
+        fprintf(stderr, "  [CONTIG] alloc %u align %u -> 0x%08X (live %u)\n",
+                size, alignment, result, g_contig_live_bytes);
+        fflush(stderr);
+    }
+    ReleaseSRWLockExclusive(&g_contig_lock);
+
+    if (!result) {
+        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u live, "
+                "%u of %u high-water, %d blocks)\n",
+                size, g_contig_live_bytes, g_contig_next - XBOX_CONTIG_BASE,
+                (unsigned)XBOX_CONTIG_SIZE, g_contig_block_count);
         fflush(stderr);
         return 0;
     }
 
-    g_contig_next = result + size;
-    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    /* Outside the allocator lock: a reused block may still be a GPU-resident
+     * surface or a watched texture, and the renderer's page-protection fault
+     * handler takes its own lock. Announcing the write first lets it retire
+     * those once instead of faulting page by page. */
+    host = (void *)((uintptr_t)result + g_memory_offset);
+    xbox_MemoryHostAccess(host, size, 1);
+    memset(host, 0, size);
     return result;
 }
 
-/* How much of the window has been handed out.
+/* Returns nonzero if xbox_va was a live block from xbox_ContiguousAlloc. */
+int xbox_ContiguousFree(uint32_t xbox_va)
+{
+    int i, found = 0;
+
+    AcquireSRWLockExclusive(&g_contig_lock);
+    for (i = 0; i < g_contig_block_count; i++) {
+        if (g_contig_blocks[i].addr > xbox_va)
+            break;
+        if (g_contig_blocks[i].addr != xbox_va || g_contig_blocks[i].free)
+            continue;
+        found = 1;
+        g_contig_live_bytes -= g_contig_blocks[i].size;
+        if (++g_contig_log <= 48) {
+            fprintf(stderr, "  [CONTIG] free 0x%08X (%u bytes, live %u)\n",
+                    xbox_va, g_contig_blocks[i].size, g_contig_live_bytes);
+            fflush(stderr);
+        }
+        g_contig_blocks[i].free = 1;
+        if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free) {
+            g_contig_blocks[i].size += g_contig_blocks[i + 1].size;
+            contig_remove(i + 1);
+        }
+        if (i > 0 && g_contig_blocks[i - 1].free) {
+            g_contig_blocks[i - 1].size += g_contig_blocks[i].size;
+            contig_remove(i);
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_contig_lock);
+    return found;
+}
+
+/* Bytes from xbox_va to the end of the live contiguous block containing it,
+ * or 0 if no live block does. Same contract as xbox_HeapBlockSize. */
+uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va)
+{
+    uint32_t size = 0;
+    int i;
+
+    AcquireSRWLockShared(&g_contig_lock);
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t lo = g_contig_blocks[i].addr;
+        if (lo > xbox_va)
+            break;
+        if (!g_contig_blocks[i].free && xbox_va - lo < g_contig_blocks[i].size) {
+            size = lo + g_contig_blocks[i].size - xbox_va;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_contig_lock);
+    return size;
+}
+
+/* Bytes of live (allocated, not freed) contiguous blocks. */
+uint32_t xbox_ContiguousLiveBytes(void)
+{
+    return g_contig_live_bytes;
+}
+
+/* How much of the window has ever been handed out (a high-water mark; it
+ * does not shrink when blocks are freed).
  *
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
- * a surface offset is physical, and only the window makes it addressable. */
+ * a surface offset is physical, and only the window makes it addressable.
+ * Lock-free on purpose: the command worker asks while holding the renderer
+ * lock, which the zero-fill above can wait on through a fault. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
 }
 
+/* DMA offsets in this arena refer to the separately backed contiguous
+ * window, including its reserved low pages. Device models share this test
+ * rather than assuming that a physical offset is also a low-RAM VA. */
+int xbox_ContiguousIsPhysical(uint32_t phys)
+{
+    return phys < xbox_ContiguousAllocatedBytes();
+}
 
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+
+static uint32_t heap_alloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -2652,6 +2971,15 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     return result;
 }
 
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t result;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    result = heap_alloc(size, alignment);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return result;
+}
+
 /* How big is the block at this guest address?
  *
  * MmQueryAllocationSize and ExQueryPoolBlockSize both ask this, and both used
@@ -2665,7 +2993,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
  * forward is asking about the block that contains it. Returns 0 for an address
  * this heap never handed out, which is what "not one of mine" has to look like.
  */
-uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+static uint32_t heap_block_size(uint32_t xbox_va)
 {
     int i;
 
@@ -2681,7 +3009,16 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+{
+    uint32_t size;
+    AcquireSRWLockShared(&g_heap_lock);
+    size = heap_block_size(xbox_va);
+    ReleaseSRWLockShared(&g_heap_lock);
+    return size;
+}
+
+static void heap_free(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
@@ -2723,6 +3060,13 @@ void xbox_HeapFree(uint32_t xbox_va)
         }
         return;
     }
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    AcquireSRWLockExclusive(&g_heap_lock);
+    heap_free(xbox_va);
+    ReleaseSRWLockExclusive(&g_heap_lock);
 }
 
 HANDLE xbox_GetMappingHandle(void)

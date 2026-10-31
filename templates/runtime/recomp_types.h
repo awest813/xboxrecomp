@@ -62,6 +62,7 @@
 #include <math.h>
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <xmmintrin.h>
+#include <emmintrin.h>
 #endif
 
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
@@ -288,6 +289,18 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
     return (int64_t)rounded;
 }
+/* frndint rounds st0 to an integer in the guest's RC mode too. It was host
+ * rint(), always round-to-nearest, but the CRT's floor() and ceil() are
+ * "set RC down/up, frndint, restore": MVP 06's floor (0x442BCC) loads control
+ * word 0x173F and ceil (0x443FFE) 0x1B3F, so floor(2.7) came out 3. */
+static inline double recomp_frndint(double value, uint16_t control) {
+    switch((control>>10)&3) {
+    case 1: return floor(value);
+    case 2: return ceil(value);
+    case 3: return trunc(value);
+    default: return nearbyint(value);   /* host default: nearest-even */
+    }
+}
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
@@ -350,6 +363,14 @@ void recomp_icall_not_code_log(uint32_t va);
 uint64_t xbox_ReadTimeStampCounter(void);
 
 void recomp_trace_enter(const char *name, uint32_t va);
+#ifdef RECOMP_GUEST_SCHEDULER
+extern volatile int32_t g_guest_contended;
+extern volatile int32_t g_guest_gpu_contended;
+void recomp_preempt(void);
+#define RECOMP_PREEMPT() do { if (g_guest_contended || g_guest_gpu_contended) recomp_preempt(); } while (0)
+#else
+#define RECOMP_PREEMPT() ((void)0)
+#endif
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);
 #define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
@@ -977,10 +998,10 @@ extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 
 static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 
-/* CVTPS2PI follows MXCSR; CVTTPS2PI truncates regardless of its rounding mode.
+/* Scalar CVT and CVTPS2PI follow MXCSR; CVTT truncates regardless of its mode.
  * Use SSE scalar conversions to avoid touching the host x87/MMX register file.
  * Non-x86 hosts use their floating-point environment for rounding instead. */
-static inline int32_t MMX_CVT_F2I(float v, int truncate)
+static inline int32_t XMM_CVT_F2I(float v, int truncate)
 {
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
     return truncate ? _mm_cvttss_si32(_mm_set_ss(v))
@@ -991,6 +1012,24 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
         return (int32_t)0x80000000u;       /* integer indefinite */
     return (int32_t)rounded;
 #endif
+}
+
+static inline int32_t XMM_CVT_D2I(double v, int truncate)
+{
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return truncate ? _mm_cvttsd_si32(_mm_set_sd(v))
+                    : _mm_cvtsd_si32(_mm_set_sd(v));
+#else
+    double rounded = truncate ? trunc(v) : nearbyint(v);
+    if (!(rounded >= -2147483648.0 && rounded < 2147483648.0))
+        return (int32_t)0x80000000u;
+    return (int32_t)rounded;
+#endif
+}
+
+static inline int32_t MMX_CVT_F2I(float v, int truncate)
+{
+    return XMM_CVT_F2I(v, truncate);
 }
 
 static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)

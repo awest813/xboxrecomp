@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "platform/guest_memory.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 
 /* ============================================================================
@@ -169,7 +170,9 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
     if (Interval->QuadPart == 0) {
         /* Zero interval = yield the thread's time slice */
+        int memory=xbox_MemorySuspend();
         SwitchToThread();
+        xbox_MemoryResume(memory);
         return STATUS_SUCCESS;
     }
 
@@ -190,13 +193,17 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         ms = (DWORD)(diff / 10000);
     }
 
+    int memory=xbox_MemorySuspend();
     if (Alertable) {
         DWORD result = SleepEx(ms, TRUE);
-        if (result == WAIT_IO_COMPLETION)
+        if (result == WAIT_IO_COMPLETION) {
+            xbox_MemoryResume(memory);
             return STATUS_ALERTED;
+        }
     } else {
         Sleep(ms);
     }
+    xbox_MemoryResume(memory);
 
     return STATUS_SUCCESS;
 }

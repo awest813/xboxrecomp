@@ -141,22 +141,22 @@ static void parse_combiner_input(DWORD packed, NV2ACombinerInput *input)
 
 /**
  * Parse a 32-bit input register DWORD containing 4 packed inputs.
- * Layout: [31:24]=D [23:16]=C [15:8]=B [7:0]=A
+ * Layout: [31:24]=A [23:16]=B [15:8]=C [7:0]=D
  */
 static void parse_four_inputs(DWORD dword, NV2ACombinerInput inputs[4])
 {
-    parse_combiner_input((dword >>  0) & 0xFF, &inputs[0]); /* A */
-    parse_combiner_input((dword >>  8) & 0xFF, &inputs[1]); /* B */
-    parse_combiner_input((dword >> 16) & 0xFF, &inputs[2]); /* C */
-    parse_combiner_input((dword >> 24) & 0xFF, &inputs[3]); /* D */
+    parse_combiner_input((dword >> 24) & 0xFF, &inputs[0]); /* A */
+    parse_combiner_input((dword >> 16) & 0xFF, &inputs[1]); /* B */
+    parse_combiner_input((dword >>  8) & 0xFF, &inputs[2]); /* C */
+    parse_combiner_input((dword >>  0) & 0xFF, &inputs[3]); /* D */
 }
 
 /**
  * Parse a 32-bit output configuration DWORD for one channel.
  *
  * Output DWORD layout:
- *   [3:0]   AB destination register
- *   [7:4]   CD destination register
+ *   [3:0]   CD destination register
+ *   [7:4]   AB destination register
  *   [11:8]  SUM destination register
  *   [12]    CD dot product flag
  *   [13]    AB dot product flag
@@ -166,8 +166,8 @@ static void parse_four_inputs(DWORD dword, NV2ACombinerInput inputs[4])
  */
 static void parse_output(DWORD dword, NV2ACombinerOutput *output)
 {
-    output->ab_dst     = (NV2ACombinerRegister)((dword >>  0) & 0xF);
-    output->cd_dst     = (NV2ACombinerRegister)((dword >>  4) & 0xF);
+    output->ab_dst     = (NV2ACombinerRegister)((dword >>  4) & 0xF);
+    output->cd_dst     = (NV2ACombinerRegister)((dword >>  0) & 0xF);
     output->sum_dst    = (NV2ACombinerRegister)((dword >>  8) & 0xF);
     output->cd_dot     = (dword >> 12) & 1;
     output->ab_dot     = (dword >> 13) & 1;
@@ -182,7 +182,6 @@ static void parse_output(DWORD dword, NV2ACombinerOutput *output)
 void d3d8_combiners_parse_token(DWORD token, const DWORD *rs,
                                 NV2ACombinerState *state)
 {
-    int i;
     memset(state, 0, sizeof(*state));
 
     /* Bits [3:0]: number of active combiner stages (1-8) */
@@ -257,22 +256,19 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
      * Parse final combiner inputs.
      *
      * D3DRS_PSFINALCOMBINERINPUTSABCD packs inputs A,B,C,D as 8 bits each:
-     *   [7:0]=A  [15:8]=B  [23:16]=C  [31:24]=D
+     *   [31:24]=A  [23:16]=B  [15:8]=C  [7:0]=D
      *
      * D3DRS_PSFINALCOMBINERINPUTSEFG packs E,F,G:
-     *   [7:0]=E  [15:8]=F  [23:16]=G  [31:24]=reserved
+     *   [31:24]=E  [23:16]=F  [15:8]=G  [7:0]=flags
      */
     {
         DWORD abcd = rs[D3DRS_PSFINALCOMBINERINPUTSABCD];
         DWORD efg  = rs[D3DRS_PSFINALCOMBINERINPUTSEFG];
 
-        parse_combiner_input((abcd >>  0) & 0xFF, &state->final_input[0]); /* A */
-        parse_combiner_input((abcd >>  8) & 0xFF, &state->final_input[1]); /* B */
-        parse_combiner_input((abcd >> 16) & 0xFF, &state->final_input[2]); /* C */
-        parse_combiner_input((abcd >> 24) & 0xFF, &state->final_input[3]); /* D */
-        parse_combiner_input((efg  >>  0) & 0xFF, &state->final_input[4]); /* E */
-        parse_combiner_input((efg  >>  8) & 0xFF, &state->final_input[5]); /* F */
-        parse_combiner_input((efg  >> 16) & 0xFF, &state->final_input[6]); /* G */
+        parse_four_inputs(abcd, state->final_input);
+        parse_combiner_input((efg >> 24) & 0xFF, &state->final_input[4]); /* E */
+        parse_combiner_input((efg >> 16) & 0xFF, &state->final_input[5]); /* F */
+        parse_combiner_input((efg >>  8) & 0xFF, &state->final_input[6]); /* G */
     }
 
     /* Per-stage constant colors */
@@ -367,7 +363,7 @@ static const char *reg_name(NV2ACombinerRegister reg)
  *   3. Mapping function (how to transform the value)
  *
  * For alpha-replicate: .aaaa swizzle
- * For normal RGB read in RGB path: .rgb (or .rgba for alpha path)
+ * For RGB reads use .rgb; alpha inputs select blue unless bit 4 selects alpha.
  *
  * The mapping function is applied inline as an arithmetic expression.
  *
@@ -400,6 +396,8 @@ static void emit_mapped_input(char *buf, int bufsize, int *off,
             snprintf(swizzle, sizeof(swizzle), ".a");
         else
             snprintf(swizzle, sizeof(swizzle), ".aaa");
+    } else if (strcmp(suffix, ".a") == 0) {
+        snprintf(swizzle, sizeof(swizzle), ".b");
     } else {
         snprintf(swizzle, sizeof(swizzle), "%s", suffix);
     }

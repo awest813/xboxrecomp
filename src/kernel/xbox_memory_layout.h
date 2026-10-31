@@ -132,25 +132,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
  * Release the reserved Xbox memory layout.
  */
 /**
- * Mirror a GPU completion fence the title spins on.
+ * Register the device chain for a GPU completion semaphore.
  *
- * The NV2A tables in xbox_memory_layout.c acknowledge handshakes that live at
+ * The NV2A flag worker acknowledges handshakes that live at
  * fixed aperture offsets. Some titles instead wait on a semaphore the GPU
  * writes into contiguous memory: D3D seeds it, submits work, then spins until
  * it reaches the submitted count. Wreckless does this at guest 0x000FE920,
  * waiting on the 96-byte MmAllocateContiguousMemoryEx block its device struct
  * points at.
  *
- * Nothing executes the push buffer -- the D3D11 layer draws -- so everything
- * submitted is complete, and advancing the fence is the same honest
- * acknowledgement the register tables make.
+ * With RECOMP_PB_EXEC, a consumed semaphore-release method writes its actual
+ * sequence to this target. Without execution, the compatibility mirror copies
+ * the producer count on each poll. A flush acknowledgment never retires it.
  *
  * The fence has no fixed address; it is reached through the title's device
  * struct, so it is registered as the chain of indirections to follow:
  *
  *     device = MEM32(device_ptr_va)
  *     fence  = MEM32(device + get_ptr_off)
- *     MEM32(fence) = MEM32(device + put_off)
+ *     MEM32(fence) = executed release (or producer count without execution)
  *
  * Every step is bounds-checked each poll, so registering a chain that is not
  * yet initialised (or never becomes valid) is harmless.
@@ -184,13 +184,24 @@ void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 
-/* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
- * below 256 MB, or 0 when the arena is exhausted. */
+/* Allocate from the contiguous (physical-mirror) arena at XBOX_CONTIG_BASE.
+ * Zeroed, page granular. Returns 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+/* Free a block xbox_ContiguousAlloc returned; nonzero if it was one. */
+int xbox_ContiguousFree(uint32_t xbox_va);
+/* Bytes to the end of the live block containing xbox_va, else 0. */
+uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va);
+uint32_t xbox_ContiguousLiveBytes(void);
+/* High-water mark of the arena: never shrinks. */
 uint32_t xbox_ContiguousAllocatedBytes(void);
+int xbox_ContiguousIsPhysical(uint32_t phys);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+/* Executed pattern/semaphore methods publish actual GPU progress. */
+void xbox_Nv2aPatternColor(uint32_t value);
+void xbox_Nv2aSemaphoreRelease(uint32_t value);
+void xbox_Nv2aSoftwareMethod(uint32_t parameter);
 
 void xbox_MemoryLayoutShutdown(void);
 
@@ -211,6 +222,8 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+size_t xbox_GetTiledAliasBytes(void);
+void *xbox_GetContigMemory(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);

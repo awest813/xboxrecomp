@@ -15,6 +15,10 @@ void xa2_shutdown(void);
 /* Returns 1 if XAudio2 is active. */
 int xa2_is_active(void);
 
+/* Pending monitor blocks (including the playing block) and pacing target. */
+int xa2_queued(void);
+int xa2_queue_target(void);
+
 /* Submit interleaved stereo 16-bit samples. Returns 1 if accepted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples);
 

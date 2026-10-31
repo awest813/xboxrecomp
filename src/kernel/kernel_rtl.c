@@ -8,6 +8,8 @@
  */
 
 #include "kernel.h"
+#include "kernel_guest.h"
+#include "platform/guest_memory.h"
 /* RECOMP_TLS, and the guest stack pointer the contention report walks. */
 #include "xbox_memory_layout.h"
 #include <stdio.h>
@@ -510,8 +512,21 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         xbox_guest_backtrace(10);
         fflush(stderr);
     }
-    EnterCriticalSection(cs);
-    xbox_cs_note_owner(cs);
+    {
+        int cpu=0,memory=0;
+        /* The shadow and diagnostics above are host-owned. A passive wait
+         * touches no guest buffer until it resumes, so do not retain RAM or
+         * the lifted CPU while another guest thread must release this lock.
+         * Preserve raised-IRQL ownership exactly as on the old path. */
+        if(xbox_CurrentIrql()<DISPATCH_LEVEL) {
+            cpu=xbox_GuestSuspend();
+            memory=xbox_MemorySuspend();
+        }
+        EnterCriticalSection(cs);
+        xbox_cs_note_owner(cs);
+        if(memory)xbox_MemoryResume(memory);
+        if(cpu)xbox_GuestResume(cpu);
+    }
     if (g_cs_contention_reports <= 16) {
         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
                 GetCurrentThreadId(),

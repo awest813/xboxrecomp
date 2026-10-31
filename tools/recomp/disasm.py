@@ -5,6 +5,7 @@ Disassembles raw bytes from the XBE and organizes instructions
 into basic blocks within each function.
 """
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Optional
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_OP_IMM, CS_OP_MEM
@@ -216,10 +217,19 @@ class Disassembler:
             for addr in [a for a, i in decoded.items()
                          if a < point < a + i.size]:
                 del decoded[addr]
+            old_starts = sorted(decoded)
             for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
                                            point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
+                # A recovered instruction can cover several stale starts from
+                # the misaligned stream, not just the one covering `point`.
+                # Keeping those starts executes bogus instructions between
+                # real ones (CRT memcpy even incremented esp/ebp this way).
+                first = bisect_right(old_starts, cs_insn.address)
+                last = bisect_left(old_starts, cs_insn.address + cs_insn.size)
+                for addr in old_starts[first:last]:
+                    decoded.pop(addr, None)
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]
