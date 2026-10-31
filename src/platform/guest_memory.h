@@ -2,6 +2,7 @@
  * the single guest CPU: passive kernel bridges and native DMA also use RAM. */
 #ifndef XBOX_GUEST_MEMORY_H
 #define XBOX_GUEST_MEMORY_H
+#include <stddef.h>
 #include <stdint.h>
 /* Optional in-memory ordering history (RECOMP_MEMORY_TRACE=1). */
 enum { XBOX_TRACE_CALL=1, XBOX_TRACE_CLEAR, XBOX_TRACE_PUBLISH,
@@ -38,4 +39,11 @@ void xbox_MemoryWaitGpu(uint32_t ticket);
  * any owned GPU lease still lasts until pixel commit. This does not publish
  * completion or release ownership. Idle work must not throttle guest polling. */
 void xbox_MemoryGpuIdle(void);
+/* Host-kernel access to guest RAM (ReadFile/WriteFile buffers) does not raise
+ * user-mode faults on protected pages; it fails the system call instead.
+ * Callers announce such ranges first so a page-protection owner (the GPU
+ * residency tracker) can make them accessible. No-op when nothing registered. */
+typedef void (*xbox_HostAccessFn)(void *p, size_t bytes, int write);
+void xbox_MemorySetHostAccessHook(xbox_HostAccessFn fn);
+void xbox_MemoryHostAccess(void *p, size_t bytes, int write);
 #endif

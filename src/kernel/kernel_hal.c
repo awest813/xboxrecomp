@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "platform/host_clock.h"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -42,7 +43,7 @@ volatile ULONG xbox_KeTickCount = 0;
 /* Call this periodically or on-demand to update KeTickCount */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = (ULONG)xbox_HostMilliseconds();
 }
 
 /* ============================================================================
@@ -677,7 +678,7 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
      * scale by 10,000. Resolution is coarser than the real kernel's, but it is
      * monotonic, which is the property callers actually depend on.
      */
-    return (ULONGLONG)GetTickCount64() * 10000ULL;
+    return (ULONGLONG)xbox_HostMicroseconds() * 10ULL;
 }
 
 /* ============================================================================

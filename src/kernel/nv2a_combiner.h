@@ -27,7 +27,32 @@ typedef struct {
     uint32_t final_c0, final_c1;            /* SET_SPECULAR_FOG_FACTOR */
     uint32_t control;                       /* SET_COMBINER_CONTROL */
     uint32_t stage_program;                 /* SET_SHADER_STAGE_PROGRAM */
+    uint32_t stage_input;                   /* SET_SHADER_OTHER_STAGE_INPUT */
 } Nv2aCombiner;
+
+/* Texture-stage modes (SET_SHADER_STAGE_PROGRAM, five bits per stage) that
+ * sample the stage's own texture: 2D projective, and the dependent reads
+ * DEPENDENT_AR / DEPENDENT_GB, which address it with the (A,R) or (G,B)
+ * of an earlier stage's result instead of a texture coordinate. MVP 06's
+ * depth-of-field composite reads its scene depth as A8R8G8B8 in stage 2 and
+ * looks the focus amount up with DEPENDENT_AR in stage 3; without the
+ * dependent read the whole frame took the blurred image. */
+#define NV2A_STAGE_2D            1u
+#define NV2A_STAGE_DEPENDENT_AR 15u
+#define NV2A_STAGE_DEPENDENT_GB 16u
+static inline int nv2a_rc_stage_samples(unsigned mode)
+{
+    return mode == NV2A_STAGE_2D || mode == NV2A_STAGE_DEPENDENT_AR
+        || mode == NV2A_STAGE_DEPENDENT_GB;
+}
+/* Which earlier stage feeds a dependent read: stage 1 always reads stage 0;
+ * stages 2 and 3 select theirs (XDK PS_INPUTTEXTURE: bits 16 and 20). */
+static inline unsigned nv2a_rc_stage_source(const Nv2aCombiner *rc, unsigned stage)
+{
+    if (stage == 2) return (rc->stage_input >> 16) & 3;
+    if (stage == 3) return (rc->stage_input >> 20) & 3;
+    return 0;
+}
 
 /* One pixel. Colours are r,g,b,a in [0,1]; `fog` is (fog colour, factor).
  * t[i] is what texture stage i produced. The result is clamped to [0,1]. */

@@ -1,70 +1,101 @@
-# MVP 06 handoff — checkpoint185
+# MVP 06 handoff — checkpoint 186
 
-2026-10-31. Stopped at the user's request for documentation, commit and push. The full objective remains **steady 30 FPS in gameplay, then rendering and accuracy**. It is not achieved. Resume deliberately; do not treat this checkpoint as a completed port.
+2026-10-31. Branch `claude/game-performance-audit-accuracy-8d9717`. One-page state of
+the world; [../AGENTS.md](../AGENTS.md) has the working rules and debugging loop,
+[ENGINEERING_LOG.md](ENGINEERING_LOG.md) the history.
 
-## State to resume from
+## Current state
 
-- No game or test helper from this session remains running. Runs178,181,182 were deliberately retired;184 crashed and its exit was observed. Recheck process state before any build or launch.
-- Normal `build/Release/mvp06_recomp.exe` and its matching MAP are build185,59,198,464 bytes, PE timestamp1793460453. EXE SHA256: `3bd995fddaebff8ebded5713c97cbf9488d7c72b59f9387c877ce6c1a3a31735`. Private `build/checkpoint185_hashes.json` records source and binary hashes.
-- Build185 links successfully and includes the retained heap/stack synchronization, centralized kernel CPU policy, and passive CS-wait repair. It has not been launched. CS fast path defaults off; do not label185 runtime-accepted.
-- Retail files, generated game C, executables, MAPs, logs and captures stay private. The current branch is `main`, tracking `mvp/main` at the dedicated MVP repository. Do not push this game checkpoint to the unrelated `origin` toolkit fork or `upstream`.
+**In-game above 30 FPS on the merged build.** The two lineages that diverged from
+the 2026-10-20 baseline are merged: the GPU-resident D3D11 renderer (branch
+`claude/game-fps-accuracy-5eb48f`) and the checkpoint-185 runtime fixes (heap/TLS
+race, critical-section waits, event-switch boundary, raster rules).
 
-## What changed and what passed
+| Area | State |
+|---|---|
+| Frame rate | Pitch selector 38.6–39.5 FPS at 54% host load (run 258). 7-minute pitching soak (run 258): 32.0, 31.7, 27.6, 27.9, 39.7, 29.9 FPS, mean ~31.5, no crash. Under 77–100% host load the same scene drops to 23–31. Menus pace at exactly 60. |
+| Rendering | Resident surfaces, filtering/mips, fog, 16-bit/swizzled targets, correct pitch-camera depth of field (dependent texture stages, new this checkpoint). |
+| Memory | Contiguous frees are reclaimed (run184's 64 MB exhaustion fixed); heap/TIB allocation serialized. |
+| Input | Keyboard → emulated USB pad. A pitch is three short A presses ~0.75 s apart. |
+| Audio | 48 kHz output; the game software-mixes SFX/speech into one ring. Listening quality unverified. |
+| Saves / full exhibition | Not verified; blocked by the between-pitch stall. |
 
-1. Normal179/run180 crashed in a TLS lookup. A native fixture using the actual allocator reproduced overlapping live allocations in round0. Heap selection, zero-fill, metadata, free and size queries are now serialized; stack capacity/reclamation is separately locked. RAM gate on/off each pass102,400 disjoint allocations,51,200 intact TLS blocks and32 concurrent stack cycles.
-2. A completed-bridge lease-release experiment passed a narrow native check but failed to establish a gameplay benefit in both measurement orders. It was removed; private `build/experiment182/` preserves the experiment. Keep the old return order.
-3. The whole-system audit found repeated CPU ticket handoffs around uncontended CS calls and RAM retained during real CS waits. `xbox_GuestKernelCall` centralizes the prior dispatch policy; optional `RECOMP_CS_GUEST_FASTPATH=1` retains CPU for277/278/294/295. Actual passive contention now releases CPU/RAM while waiting. Native fastpath0/1 × GIL0/1 all pass FIFO, real contention, recursion, coherent GPU commits and raised-IRQL checks. Existing memory-scope and scheduler tests pass. The fast path remains unpromoted.
+Title defaults live in `mvp06/src/main.c` (`envs[]`): D3D11, GPU residency, every
+batch on the GPU, packed readback, flip pacing, VBLANK, GIL, USB pad on port 2,
+keyboard, DSP doorbells. RECOMP_GPU_SCOPES stays off. `RECOMP_CS_GUEST_FASTPATH=1`
+(keep the lifted CPU across uncontended Enter/Leave) is opt-in: native tests pass in
+all GIL × policy modes and run 257 played fine with it, but no matched comparison
+separates its effect from host load.
 
-## Latest runtime evidence and failure
+Accuracy fixes after run 258 (from other EA ports): guest clocks at 1 ms from the
+performance counter (`src/platform/host_clock.h`; KeTickCount on a dedicated thread,
+drift-free kernel timers), APU interrupt delivered on vector 0x35
+(`RECOMP_APU_IRQ=0` disables), and rounding-mode-aware `frndint`
+(`recomp_frndint`; lifter emits it, the 22 local generated sites are patched).
+Runs 260–261 pitch normally with them. `recomp_0015.c` also carries a local
+`[ANIMMISS]` probe in `sub_00329D20` (generated-only; a re-lift removes it).
 
-Run182 (heap repair, rejected bridge binary switched back to old order0) reaches exhibition, completes one pitch/count1–0, opens pause, and resumes; the resumed published framebuffer was saved. Second pitch and complete exhibition remain unverified. Final audit:3451 PATH, zero logged crashes; deliberately stopped for this handoff. GPU/memory timing was enabled one way for the later diagnostic profile, so those rates are not a normal baseline.
+No game or helper process is left running. `mvp06/build/Release/mvp06_recomp.exe`
+is build 261 (merge + contiguous + DOF + the fixes above). `mvp06/build/fast254_mvp06_recomp.exe/.map`
+is the pre-merge resident build kept for comparison.
 
-Run184 explicitly enables the CS fast path. It passes startup and several idle-demo/frontend transitions, then **crashes during exhibition loading after contiguous-arena exhaustion**. Observed exit3221225477 (0xC0000005), fault RVA0x308EB63=`sub_005E99A1+0x103`, guest EAX/EBX=`0xBB55BB55`, fault VA0xBB55BBD5. Before the fault, the64 MB contiguous arena reports66,960,000 bytes consumed and cannot allocate1,228,800 /131,072-byte buffers; later tiny allocations also fail. No FPS comparison was completed on184. The selector gate timing out was an observation failure; the exit record and crash log prove terminal failure.
+## Open issues (priority order)
 
-The allocator is still bump-only. `bridge_MmFreeContiguousMemory` routes graphics addresses to `xbox_HeapFree`, whose table contains ordinary-heap allocations; contiguous allocations have no reclamation metadata. `MmQueryAllocationSize` also queries only that table. This is a demonstrated lifetime defect and a strong explanation for exhaustion after repeated demos/loading. The exact poison-pointer path and whether the CS policy contributes remain to be isolated; do not claim a controlled attribution.
+1. **Between-pitch stall.** After every pitch the pitcher paces the mound ~64 s
+   (pitch-to-pitch 70–79 s in soaks 256–261) before the selector returns; with a
+   runner on first it never returns (reproduced live, run 259). Ruled out: dispatch
+   misses, stubs, blocked threads, pad state and every button, disc I/O, the audio
+   clock (48 kHz), x87 precision, failed animation lookups (probe, run 259), clock
+   resolution, the DirectSound interrupt and floor/ceil rounding (all fixed, runs
+   260–261, no change). Next: find which igflow wait command (`cWaitForActiveActors`,
+   `cWaitForAnimation`, `WaitForSuitableBreakInTheAction`, …) the post-pitch flow is
+   parked in; consider comparing with maddog847's MVP 2005 XBERecomp source package.
+   Details in [GAMEPLAY_RENDER_AUDIT.md](GAMEPLAY_RENDER_AUDIT.md).
+2. **Animation-lookup crash.** Run 256 faulted after pitch 6 reading 0xFFFFFFFF in
+   `sub_00331FB0` at 0x331FF4: `sub_00329D20` (search up to four animation banks)
+   returned −1 and the caller dereferenced it. The stall's main-thread sample is in
+   the same subsystem. Working hypothesis: an animation ID the play needs is missing
+   from the loaded banks. Next: log ID and bank pointers on every −1 return.
+3. **Camera-cut flash.** Some cuts show one pale-blue full-screen frame (run 249).
+4. **Preflight dispatch chunk.** `gen/recomp_9999.c` (0x5E440/0x56B60) and the
+   hand-bumped table count (37764) should be replaced by a full disasm/lift cycle;
+   re-verify the 0x3DD40 event switch afterwards (`recomp_0001.c` currently carries it).
+5. Not yet checked: audio listening quality, saves, a nine-inning exhibition,
+   batting/fielding FPS.
 
-**Next action:** repair and test contiguous allocation/free/query lifetime, preserving alignment, pinned physical ranges, low64 KB and GPU-instance reservations, true contiguous/tiled aliases, and distinction from low RAM. Do not grow the arena or strip address bits to hide the leak. First reproduce repeated allocation/free exhaustion in a native fixture, then compare fresh normal runs and demo→exhibition cycles. Keep the CS fast path off until the failure is isolated and matched comparisons plus gameplay acceptance pass.
+## Measuring and driving the game
 
-## Whole-system performance findings
+Private helpers in the gitignored `mvp06/build/`, run with a Python that has Pillow
+(`/c/Users/allen/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe`;
+plain `py -3` lacks it):
+- `snap_run.py RUN [ENV=VAL…]`: launch, route the frontend to the pitch selector,
+  save `snapRUN.png`, leave the game running.
+- `soak.py PID RUN --minutes M --nudge 0`: pitch whenever the selector is detected;
+  logs pitches and FPS every minute. The selector detector compares the HUD region
+  with `pitch134_selector_before.bmp` and `pitchRUN_selector_before.bmp`; since the
+  DOF fix the old reference scores ~9.3 (threshold 8), so copy a current selector
+  capture to `pitchRUN_selector_before.bmp` before starting.
+- `read_render_stats.py PID --seconds 20`: FPS and renderer totals.
+- `test_pitch_loop.py PID RUN`, `watch_selector.py RUN SECS`, `thread_state89.py PID`.
+Repo tools: `tools_sample.py --pid` and `tools_stackscan.py --pid` attach without
+killing the game. Always record host CPU load next to an FPS sample.
 
-[SYSTEM_PERFORMANCE_AUDIT184.md](SYSTEM_PERFORMANCE_AUDIT184.md) contains the pipeline, host constraints and measured costs. Single-instance diagnostic182:20.002s/35 flips=1.750 FPS;2068 resolves (59.09/flip),16.75 MB readback and16.33 MB surface upload per flip;8.209s in readback Map wall time. Main/renderer threads mostly wait; frame presentation sleeps most samples. Timers overlap and include host descheduling. CPU load repeatedly reached99–100% with unrelated work; the requested ten-minute wait did not remove contention.
-
-Historical controlled178 selector3.77→4.05 FPS and its two-pitch/pause pass remain valid scene-specific evidence. Recent noisy1–4 FPS results establish no further speedup. Reaching30 FPS needs fewer GPU/RAM round trips and scheduling waits, not just copy-byte reductions. Preserve all completion/alias/IRQ contracts.
-
-## Build, run and acceptance
-
-From the root, after confirming no live normal executable:
-
-```powershell
-cmake -S mvp06 -B mvp06/build
-cmake --build mvp06/build --config Release --target mvp06_recomp
-$env:RECOMP_CS_GUEST_FASTPATH = '0'
-Push-Location mvp06
-.\build\Release\mvp06_recomp.exe
-Pop-Location
-```
-
-Run with a retained process handle and exit record. Main defaults select D3D11/packed/scopes/cutoff4096/yield1/handoff2000/vblank; explicit overrides win. Toolkit handoff defaults off. Exclusive slices4096/coarse2ms and synchronous fallback512 remain mandatory. Normal test-key hold0, tracing/timing off for FPS comparisons, user mute preference preserved.
-
-Use the computer-use skill for inputs. Read-only private `capture_present182.py` / `capture_present184.py` validate loaded PE/MAP and two identical published pixel snapshots; they avoid unreliable desktop capture. Update strict executable/MAP guards for any new candidate. Private `gate_present184.py` compares two captured selector signatures; it sent no input. The184 gate failed before the crash; do not cite it as selector acceptance.
-
-After the lifetime fix: verify startup, idle-demo return, fresh Play Now selector, two pitches/count2–0, pause/resume, full exhibition and save/reload. Compare PATH/fault signatures and saved images, then run controlled FPS samples in both orders with input and host-load provenance. Steady30 FPS requires sustained gameplay and frame pacing, not menu/demo FPS.
+Diagnostics (default off): RECOMP_EXEC_TIMING=1 (per-flip build/draw/trap/idle ms);
+RECOMP_DRAW_LOG_FLIP=N or RECOMP_DRAW_LOG_TRIGGER=<file> (every batch of one flip,
+with depth func, stage program and combiner words); RECOMP_VP_CHECK=1,
+RECOMP_VP_BLOCK_CHECK=1, RECOMP_TEXTURE_DECODE_CHECK=1. The first 48 contiguous
+allocations/frees are always logged as `[CONTIG]`.
 
 ## Native checks
 
-```powershell
-cmake --build mvp06/build --config Release --target heap_concurrency_smoke critical_section_smoke memory_scope_smoke guest_scheduler_smoke
-$env:RECOMP_GPU_SCOPES = '1'
-foreach ($gil in @('0','1')) {
-  foreach ($fast in @('0','1')) {
-    $env:RECOMP_GIL = $gil
-    $env:RECOMP_CS_GUEST_FASTPATH = $fast
-    & .\mvp06\build\xboxrecomp\src\kernel\critical_section_smoke\Release\critical_section_smoke.exe
-    if ($LASTEXITCODE) { throw 'critical-section regression' }
-  }
-}
+```bash
+cmake --build mvp06/build --config Release --parallel 8 --target heap_concurrency_smoke \
+    critical_section_smoke memory_scope_smoke guest_scheduler_smoke nv2a_pb_smoke \
+    nv2a_ack_smoke nv2a_render_smoke nv2a_pb_scan_smoke
 ```
 
-Heap fixture also passes scopes0/1. Memory-scope tests use scopes1 and cover yield/handoff, publication, host waits, IRQL and2,000 coherent DMA commits. Latest logs: `build/cs184_gil*_fast*.txt`, `memory184.txt`, `heap181_stacks_gateon.txt`, `heap181_stacks_gateoff.txt`, `build185_log.txt`. Existing walker and614,784-case exact surface-bound checks passed earlier this session. No new lifter changes were made; earlier lifter/render suites are historical, not rerun185.
-
-Full regeneration and protected-boundary instructions are in [../AGENTS.md](../AGENTS.md). [README.md](README.md) indexes all evidence and archived checkpoints. Do not repeat a long sequence of stale checkpoint instructions before reading this current state.
+All pass at checkpoint 186: heap fixture (now with the contiguous lifetime cycle) at
+RECOMP_GPU_SCOPES=0/1; `critical_section_smoke` at GIL 0/1 × fastpath 0/1;
+`nv2a_render_smoke` on WARP and `--hardware` (2607 draws, 0 failures, including the
+dependent-read cases); memory scope, scheduler, pushbuffer, ack and scan smokes.
+`nv2a_pb_smoke --gpu-layout` reports flips=271000, draws=270872 (unchanged).

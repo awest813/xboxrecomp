@@ -184,9 +184,15 @@ void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 
-/* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
- * below 256 MB, or 0 when the arena is exhausted. */
+/* Allocate from the contiguous (physical-mirror) arena at XBOX_CONTIG_BASE.
+ * Zeroed, page granular. Returns 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+/* Free a block xbox_ContiguousAlloc returned; nonzero if it was one. */
+int xbox_ContiguousFree(uint32_t xbox_va);
+/* Bytes to the end of the live block containing xbox_va, else 0. */
+uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va);
+uint32_t xbox_ContiguousLiveBytes(void);
+/* High-water mark of the arena: never shrinks. */
 uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_ContiguousIsPhysical(uint32_t phys);
 
@@ -216,6 +222,8 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+size_t xbox_GetTiledAliasBytes(void);
+void *xbox_GetContigMemory(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);

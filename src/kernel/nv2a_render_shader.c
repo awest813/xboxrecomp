@@ -82,8 +82,15 @@ int nv2a_render_pixel_shader(const Nv2aCombiner *rc, int has_combiner,
         emit(&w,"R[%u]=float4(0,0,0,1);\n",8+i);
         if(mode==1) {
             emit(&w,"if(texinfo[%u].w && abs(input.t%u.w)>=1e-20) { float2 uv=input.t%u.xy/input.t%u.w;"
-                    " if(!texinfo[%u].z)uv/=texinfo[%u].xy;R[%u]=tex%u.Sample(samp%u,uv); }\n",
-                    i,i,i,i,i,i,8+i,i,i);
+                    " if(!texinfo[%u].z)uv/=texinfo[%u].xy;R[%u]=tex%u.Sample(samp%u,uv);"
+                    " if(texinfo[%u].w>1.5)R[%u].a=1; }\n",
+                    i,i,i,i,i,i,8+i,i,i,i,8+i);
+        } else if(i && (mode==NV2A_STAGE_DEPENDENT_AR || mode==NV2A_STAGE_DEPENDENT_GB)) {
+            /* An earlier stage's colour is the (normalized) coordinate. */
+            emit(&w,"if(texinfo[%u].w) { R[%u]=tex%u.Sample(samp%u,R[%u].%s);"
+                    " if(texinfo[%u].w>1.5)R[%u].a=1; }\n",
+                    i,8+i,i,i,8+nv2a_rc_stage_source(rc,i),
+                    mode==NV2A_STAGE_DEPENDENT_AR?"ar":"gb",i,8+i);
         } else if(mode==4) emit(&w,"R[%u]=saturate(input.t%u);\n",8+i,i);
         else if(mode==5) {
             emit(&w,"[unroll]for(uint j=0;j<4;j++) { bool ge=(control.w>>(%u+j))&1;"

@@ -16,7 +16,19 @@ static uint32_t presented_va, presented_pitch;
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch)
 { presented_va = va; presented_pitch = pitch; }
 void xbox_FramebufferWindowStart(void) {}
+/* No window: the executor keeps presenting through guest RAM. */
+int xbox_FramebufferWindowActive(uint32_t *width, uint32_t *height)
+{ (void)width; (void)height; return 0; }
+void xbox_FramebufferWindowPresentPixels(const uint8_t *pixels, uint32_t pitch)
+{ (void)pixels; (void)pitch; }
 void xbox_Nv2aFrameCounterFlip(void) {}
+/* No vblank handler here: flips complete without pacing. */
+volatile uint64_t g_nv2a_idle_ticks;
+int nv2a_ack_flip_pacing(void) { return 0; }
+uint32_t nv2a_ack_take_flip_increments(void) { return 0; }
+void nv2a_ack_tick(volatile void *registers) { (void)registers; }
+void nv2a_trap_stats(uint64_t *count, uint64_t *wait_ticks)
+{ if (count) *count = 0; if (wait_ticks) *wait_ticks = 0; }
 static uint32_t pattern_color, pattern_writes, released_fence, fence_writes, fence_order_errors;
 static uint32_t trap_parameter, trap_calls, trap_seen_pixel;
 void xbox_Nv2aSoftwareMethod(uint32_t value)

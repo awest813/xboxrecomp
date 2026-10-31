@@ -49,6 +49,8 @@ int mock_xa2_submit_samples(const int16_t *samples, int frames)
     return 1;
 }
 int xbox_ContiguousIsPhysical(uint32_t p) { (void)p; return 0; }
+/* The kernel delivers the APU line; this fixture has no kernel. */
+void xbox_ApuInterruptLine(int level) { (void)level; }
 
 static unsigned check_interleaved_block(MCPXAPUState *d,unsigned off_mask)
 {

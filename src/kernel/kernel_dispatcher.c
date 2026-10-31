@@ -6,6 +6,7 @@
  */
 #include "kernel_dispatcher.h"
 #include "platform/guest_memory.h"
+#include "platform/host_clock.h"
 #include <stdint.h>
 
 static SRWLOCK s_lock = SRWLOCK_INIT;
@@ -196,7 +197,7 @@ LONG xbox_DispatcherPulseEvent(void *header)
 NTSTATUS xbox_DispatcherWait(ULONG count, const XboxDispatcherWaitItem *items,
                             int wait_all, BOOLEAN alertable, const LARGE_INTEGER *timeout)
 {
-    ULONGLONG start = GetTickCount64(), duration = timeout_ms(timeout);
+    ULONGLONG start = xbox_HostMilliseconds(), duration = timeout_ms(timeout);
     ULONG i, j;
     DispatcherWaiter w = {items, count, wait_all, 0, alertable, STATUS_TIMEOUT, NULL};
     DispatcherWaiter **link;
@@ -218,7 +219,7 @@ NTSTATUS xbox_DispatcherWait(ULONG count, const XboxDispatcherWaitItem *items,
     for (;;) {
         if (w.completed || try_wait(&w)) break;
         {
-            ULONGLONG elapsed = GetTickCount64() - start;
+            ULONGLONG elapsed = xbox_HostMilliseconds() - start;
             DWORD slice = 4;
             if (elapsed >= duration) { w.result = STATUS_TIMEOUT; break; }
             if (duration - elapsed < slice) slice = (DWORD)(duration - elapsed);

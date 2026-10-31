@@ -112,6 +112,31 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     xbox_MemoryLeave();
 }
 
+/* Publish a completed frame the renderer produced itself (a GPU copy of the
+ * surface), in the same format the guest surface would have. No guest RAM
+ * is read, so no RAM reader is taken. */
+void xbox_FramebufferWindowPresentPixels(const uint8_t *pixels, uint32_t pitch)
+{
+    if (!s_fb_running || !pixels || !pitch || getenv("RECOMP_FB_VA"))
+        return;
+    AcquireSRWLockExclusive(&s_present_lock);
+    if (!s_present)
+        s_present = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    if (s_present) {
+        fb_convert(pixels, pitch, s_present);
+        s_present_valid = 1;
+    }
+    ReleaseSRWLockExclusive(&s_present_lock);
+}
+
+/* Whether a window is showing frames, and its size in pixels. */
+int xbox_FramebufferWindowActive(uint32_t *width, uint32_t *height)
+{
+    if (width) *width = s_fb_width;
+    if (height) *height = s_fb_height;
+    return s_fb_running && !getenv("RECOMP_FB_VA");
+}
+
 /* Copy under the same lock as publication, then release it before GDI or
  * file I/O. Even several flips during a refresh cannot overwrite its pixels. */
 static int fb_copy_presented(uint32_t *pixels)
@@ -280,5 +305,7 @@ void xbox_FramebufferWindowStart(void)
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowPresentPixels(const uint8_t *pixels, uint32_t pitch) { (void)pixels; (void)pitch; }
+int xbox_FramebufferWindowActive(uint32_t *width, uint32_t *height) { (void)width; (void)height; return 0; }
 void xbox_FramebufferWindowStart(void) {}
 #endif

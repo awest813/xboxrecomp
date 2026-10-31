@@ -26,6 +26,8 @@
  */
 
 #include "kernel.h"
+#include "platform/host_clock.h"
+#include <limits.h>
 #include "kernel_thread_object.h"
 #include "kernel_dpc_queue.h"
 #include "kernel_dispatcher.h"
@@ -170,8 +172,8 @@ static void kernel_data_init(void)
     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
-     * A background thread in main.c updates this every ~1ms. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = GetTickCount();
+     * xbox_tick_count_thread (xbox_memory_layout.c) advances it every 1 ms. */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = (uint32_t)xbox_HostMilliseconds();
 
     /* LaunchDataPage (ordinal 164).
      *
@@ -750,7 +752,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    /* Window addresses belong to the contiguous allocator; the ordinary heap
+     * table never holds them, so sending them there leaked every block. */
+    if (addr - XBOX_CONTIG_BASE < XBOX_CONTIG_SIZE)
+        xbox_ContiguousFree(addr);
+    else
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
@@ -1969,10 +1976,14 @@ static void bridge_KeRemoveQueueDpc(void)
  * DPC runs on the next drain rather than immediately. Nothing here depends on
  * DPC ordering beyond "after the ISR".
  */
+static void kernel_wake_timer_thread(void);
 static void bridge_KeInsertQueueDpc(void)
 {
     if(s_in_gpu_isr)s_gpu_dpc=STACK_ARG(0);
     g_eax = (uint32_t)xbox_DpcQueueInsert(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
+    /* A queued DPC runs on the timer thread; do not leave it for the tick. */
+    if (g_eax)
+        kernel_wake_timer_thread();
 }
 
 /* Call a connected interrupt service routine.
@@ -2054,16 +2065,55 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_VECTOR            0x33u
 
 static int kernel_ensure_timer_thread(void);
+/* Wakes the timer thread early. Its sleep is a vblank/10 ms deadline at the
+ * host's default 15.6 ms timer resolution, and an NV2A software-method trap
+ * stalls the GPU until the guest handler (run from this thread) takes it:
+ * MVP 06's ~4 traps a flip each waited half a tick, ~20 ms of every frame.
+ * vblank and timers are deadline-checked, so an early wake adds neither. */
+static HANDLE s_timer_wake;
+static void kernel_wake_timer_thread(void)
+{
+    if (s_timer_wake)
+        SetEvent(s_timer_wake);
+}
 static void kernel_nv2a_request_interrupt(void *unused)
 {
     (void)unused;
     kernel_ensure_timer_thread();
+    kernel_wake_timer_thread();
 }
 
 void xbox_Nv2aSoftwareMethod(uint32_t parameter)
 {
     nv2a_trap_dispatch(XBOX_TO_NATIVE(XBOX_NV2A_REG_BASE),parameter,
                        kernel_nv2a_request_interrupt,NULL);
+}
+
+/* The APU's interrupt line (apu_core.c update_irq). Level-triggered: the
+ * timer thread calls the connected ISR while it is asserted, and the ISR's
+ * ISTS write lowers it. */
+#define APU_VECTOR 0x35u
+static volatile LONG s_apu_irq_line, s_apu_irq_mode = -1;
+void xbox_ApuInterruptLine(int level)
+{
+    if (s_apu_irq_mode < 0) {
+        const char *e = getenv("RECOMP_APU_IRQ");
+        InterlockedCompareExchange(&s_apu_irq_mode, !(e && *e == '0'), -1);
+    }
+    if (!s_apu_irq_mode) return;
+    InterlockedExchange(&s_apu_irq_line, level != 0);
+    if (level) kernel_wake_timer_thread();
+}
+static void kernel_apu_interrupt_tick(void)
+{
+    static volatile LONG raised;
+    if (!s_apu_irq_line || !xbox_GetConnectedInterrupt(APU_VECTOR)) return;
+    if (InterlockedIncrement(&raised) <= 4) {
+        fprintf(stderr, "  [APU] raising DirectSound interrupt (vector 0x35)
+");
+        fflush(stderr);
+    }
+    kernel_raise_interrupt(APU_VECTOR);
 }
 
 static void kernel_nv2a_interrupt_tick(void)
@@ -2083,7 +2133,7 @@ static uint64_t kernel_vblank_now_us(void)
     uint64_t n,f;
     if(!frequency.QuadPart)QueryPerformanceFrequency(&frequency);
     if(!frequency.QuadPart || !QueryPerformanceCounter(&count))
-        return (uint64_t)GetTickCount64()*1000;
+        return xbox_HostMicroseconds();
     n=(uint64_t)count.QuadPart;f=(uint64_t)frequency.QuadPart;
     return (n/f)*1000000+(n%f)*1000000/f;
 }
@@ -2322,16 +2372,18 @@ static void bridge_KeInitializeTimerEx(void)
  * absolute due time is treated as immediate, which is wrong in principle and
  * has not come up in practice.
  *
- * ponytail: one thread, a fixed table, and a 10 ms tick, so a due time is late
- * by up to a tick and a periodic timer drifts. Nothing here is scheduling
- * audio off a timer. A title that needs better wants the host's timer queue,
- * not a smaller sleep.
+ * One thread and a fixed table. Due times are microseconds on the precise
+ * host clock (platform/host_clock.h) and a periodic timer re-arms from its
+ * previous due time, so it keeps its rate instead of drifting. They used to be
+ * GetTickCount64 milliseconds re-armed from "now": with that clock's 15.6 ms
+ * steps a 16 ms period fired every ~31 ms, half the rate a title's 60 Hz
+ * alarm expects. The thread sleeps until the nearest due timer or vblank.
  */
 #define XBOX_MAX_TIMERS 32
 typedef struct {
     uint32_t timer_va;      /* the guest KTIMER, 0 for a free slot */
     uint32_t dpc_va;
-    long long due_ms;       /* host tick when it fires */
+    long long due_us;       /* host clock (microseconds) when it fires */
     long      period_ms;    /* 0 for one-shot */
 } XboxTimer;
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
@@ -2369,25 +2421,45 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(s_vblank_clock.started ?
-            nv2a_vblank_wait_ms(&s_vblank_clock,kernel_vblank_now_us()) : 10);
+        {
+            DWORD wait = s_vblank_clock.started ?
+                nv2a_vblank_wait_ms(&s_vblank_clock,kernel_vblank_now_us()) : 10;
+            long long next = LLONG_MAX, at = (long long)xbox_HostMicroseconds();
+            EnterCriticalSection(&g_timer_lock);
+            for (i = 0; i < XBOX_MAX_TIMERS; i++)
+                if (g_timers[i].timer_va && g_timers[i].due_us < next)
+                    next = g_timers[i].due_us;
+            LeaveCriticalSection(&g_timer_lock);
+            if (next != LLONG_MAX) {
+                long long ms = next <= at ? 0 : (next - at + 999) / 1000;
+                if (ms < (long long)wait) wait = (DWORD)ms;
+            }
+            WaitForSingleObject(s_timer_wake, wait);
+        }
         kernel_nv2a_interrupt_tick();
+        kernel_apu_interrupt_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
-        now = (long long)GetTickCount64();
+        now = (long long)xbox_HostMicroseconds();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
 
             EnterCriticalSection(&g_timer_lock);
-            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+            if (!g_timers[i].timer_va || now < g_timers[i].due_us) {
                 LeaveCriticalSection(&g_timer_lock);
                 continue;
             }
             fired_va = g_timers[i].timer_va;
             dpc = g_timers[i].dpc_va;
-            if (g_timers[i].period_ms > 0)
-                g_timers[i].due_ms = now + g_timers[i].period_ms;
+            if (g_timers[i].period_ms > 0) {
+                long long period = (long long)g_timers[i].period_ms * 1000;
+                g_timers[i].due_us += period;
+                /* Far behind (a stall, a debugger): resume the cadence from
+                 * now rather than firing a burst of stale periods. */
+                if (g_timers[i].due_us <= now - 4 * period)
+                    g_timers[i].due_us = now + period;
+            }
             else
                 g_timers[i].timer_va = 0;      /* one-shot, done */
             LeaveCriticalSection(&g_timer_lock);
@@ -2417,6 +2489,7 @@ static BOOL CALLBACK kernel_timer_init(PINIT_ONCE once,PVOID param,PVOID *contex
     HANDLE thread;
     (void)once;(void)param;(void)context;
     InitializeCriticalSection(&g_timer_lock);
+    s_timer_wake=CreateEvent(NULL,FALSE,FALSE,NULL);
     thread=CreateThread(NULL,0,kernel_timer_thread,NULL,0,NULL);
     if(!thread) {
         DeleteCriticalSection(&g_timer_lock);
@@ -2436,11 +2509,19 @@ static int kernel_ensure_timer_thread(void)
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
 {
-    long long delay_ms = (due_100ns < 0) ? (-due_100ns) / 10000 : 0;
+    long long delay_us = (due_100ns < 0) ? (-due_100ns) / 10 : 0;
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
     if (!kernel_ensure_timer_thread()) { g_eax=0;return; }
+    {
+        static volatile LONG logged;
+        if (InterlockedIncrement(&logged) <= 32) {
+            fprintf(stderr, "  [TIMER] set 0x%08X delay %lld us period %ld ms dpc 0x%08X\n",
+                    timer_va, delay_us, period_ms, dpc_va);
+            fflush(stderr);
+        }
+    }
 
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -2450,7 +2531,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     if (free_slot >= 0) {
         g_timers[free_slot].timer_va  = timer_va;
         g_timers[free_slot].dpc_va    = dpc_va;
-        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
+        g_timers[free_slot].due_us    = (long long)xbox_HostMicroseconds() + delay_us;
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
@@ -3871,7 +3952,9 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    uint32_t addr = STACK_ARG(0);
+    g_eax = addr - XBOX_CONTIG_BASE < XBOX_CONTIG_SIZE
+        ? xbox_ContiguousBlockSize(addr) : xbox_HeapBlockSize(addr);
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */
@@ -5935,7 +6018,7 @@ static void bridge_MmGlobalData(void)
 static void bridge_KeInterruptTime(void)
 {
     /* Refresh the 100ns-since-boot counter before handing out the pointer. */
-    ULONGLONG t = (ULONGLONG)GetTickCount64() * 10000ull;
+    ULONGLONG t = (ULONGLONG)xbox_HostMicroseconds() * 10ull;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;

@@ -1,20 +1,47 @@
 # MVP 06 implementation plan
 
-Checkpoint185,2026-10-31. Work is stopped for handoff. Current state and commands: [docs/HANDOFF.md](docs/HANDOFF.md). Detailed initial audit and original milestone history: [archive](docs/archive/PLAN_PRE185.md).
+Checkpoint 186, 2026-10-31. Current state and commands: [docs/HANDOFF.md](docs/HANDOFF.md).
+The original toolchain audit and milestone history are archived:
+[checkpoint-185 lineage](docs/archive/PLAN_PRE185.md), [resident-renderer lineage](docs/archive/PLAN_FAST254_2026-10-23.md).
 
 ## Objective and order
 
-Get in game to steady30 FPS, then improve rendering and accuracy. Preserve original gameplay and timing. Boot, a clean short run, native microbenchmarks, or a local selector gain do not satisfy this objective.
+Get in game at a steady 30 FPS or better, then make it accurate. Preserve original
+gameplay and timing. Menus pace at exactly 60 (the title's own presentation rate);
+gameplay may run up to 60.
+
+## Done at checkpoint 186
+
+- The resident D3D11 renderer and the runtime-correctness fixes are on one branch.
+  The pitch selector runs 38–40 FPS at 54% host load (23–36 under heavier load).
+- Contiguous memory is freed and reused (run184's arena exhaustion).
+- The pitch-camera depth-of-field composite is correct (dependent texture stages).
 
 ## Next stages
 
-1. **Restore repeatable resource lifetime.** Fix contiguous allocation/free/query bookkeeping exposed by demo→exhibition arena exhaustion in184. Reproduce natively; preserve graphics aliases and reserved regions. Build185 itself is unlaunched.
-2. **Establish a reliable gameplay baseline.** Fresh run with observed exit, normal timing/tracing off and CS fast path0. Verify selector and two-pitch/pause acceptance plus repeat demo/loading. Record host load; recent CPU saturation invalidates broad performance claims.
-3. **Measure scheduling changes.** The actual CS wait repair passes native checks. Keep the optional uncontended CS policy off until matched same-process comparisons in both orders and gameplay checks establish its effect.
-4. **Reduce system-wide GPU/RAM round trips.** Use the [whole-system audit](docs/SYSTEM_PERFORMANCE_AUDIT184.md). About59 resolves/flip persist in the diagnostic scene. A resident-surface/CPU-visibility design must cover all aliases, native API probes, CPU/software writes, renderer serialization, fences and IRQs. Do not skip commits or expand budgets to improve a counter.
-5. **Verify steady30 FPS.** Measure sustained gameplay and frame pacing across pitching, batting, fielding, transitions and pause/resume, with simulation timing and audio continuity checked. Full exhibition and save/reload remain open.
-6. **Rendering and accuracy audit.** Follow [the audit backlog](docs/GAMEPLAY_RENDER_AUDIT.md): original-console images, geometry/clipping, depth/stencil, texture/fog/blend behavior, input, gameplay rules, audio and persistence. Enhancements follow baseline fidelity.
+1. **Between-pitch stall and the animation-lookup crash.** After each pitch the
+   pitcher idles 25–70 s before the selector returns, indefinitely with a runner on
+   first. Run 256 crashed after pitch 6 dereferencing a failed animation lookup
+   (`sub_00329D20` returned −1 at 0x331FF4). Find which ID is missing from the
+   loaded banks and why. See HANDOFF "Open issues".
+2. **Gameplay FPS under load.** Matched comparison of `RECOMP_CS_GUEST_FASTPATH=1`
+   (opt-in, native tests pass) in both orders with host load recorded; profile the
+   GPU command worker with RECOMP_EXEC_TIMING=1 during batting/fielding, not only
+   at the selector.
+3. **Complete exhibition.** Pitching, batting, fielding, inning and game transitions,
+   pause/replay/box score, then save, exit, restart and reload.
+4. **Rendering accuracy.** Pale-blue flash on some camera cuts; remaining texture-stage
+   modes (cube map, bump-env, dot products) if a draw log shows them; compare fixed
+   scenes against original-console captures.
+5. **Audio.** Listen for continuity and timing across a long session (output is
+   48 kHz; audible quality is unverified).
+6. **Full lift.** Replace the local `recomp_9999.c` preflight chunk and the
+   hand-bumped dispatch count with a full disasm/lift cycle, then re-verify the
+   0x3DD40 event switch.
 
 ## Acceptance discipline
 
-Keep the complete objective intact. Separate native correctness, runtime behavior, scene-specific speed and broad playability claims. Test the failed behavior before/after, preserve input/scene provenance, and record crashes and deliberate stops explicitly. The source/defaults and the loaded EXE/MAP must agree before interpreting a sample.
+Separate native correctness, runtime behaviour, scene-specific speed and broad
+playability claims. Test the failed behaviour before and after, keep input and scene
+provenance, and record crashes and deliberate stops explicitly. The source, the
+defaults and the loaded EXE/MAP must agree before a sample is interpreted.

@@ -5,9 +5,8 @@
 #define NV2A_ACK_VBLANK_HANDOFF 1
 
 void nv2a_ack_tick(volatile void *registers);
-/* Windows: RECOMP_NV2A_ACK_POLL_US=1..1000 requests an idle
- * high-resolution timer (default 100); zero/invalid values retain Sleep(0). Requests
- * keep a two-millisecond fast polling burst. Timer failure falls back. */
+/* Windows: spins while flags are raised, then backs off to 250 us
+ * high-resolution waits after ~2,000 idle polls (RECOMP_ACK_BACKOFF=0 spins). */
 int nv2a_ack_start(volatile void *registers);
 void nv2a_ack_stop(void);
 /* Retain the software-method source while its ISR/DPC reads plain RAM MMIO.
@@ -20,6 +19,10 @@ int nv2a_ack_vblank_publish(volatile void *registers);
 void nv2a_ack_vblank_write(volatile void *registers,uint32_t value);
 void nv2a_ack_vblank_drop(volatile void *registers);
 void nv2a_ack_request_stop(void);
+/* RECOMP_FLIP_PACING=1: PGRAPH_INCREMENT (READ_3D) writes by the title's
+ * vblank handler, counted since the last call. */
+uint32_t nv2a_ack_take_flip_increments(void);
+int nv2a_ack_flip_pacing(void);
 int nv2a_ack_stopping(void);
 
 #endif

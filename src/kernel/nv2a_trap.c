@@ -54,9 +54,16 @@ void nv2a_trap_handler_taken(volatile void *registers)
     if(s_taken_event)SetEvent(s_taken_event);
 }
 
+static volatile LONG64 s_trap_count, s_trap_wait;
+void nv2a_trap_stats(uint64_t *count, uint64_t *wait_ticks)
+{
+    if(count)*count=(uint64_t)InterlockedCompareExchange64(&s_trap_count,0,0);
+    if(wait_ticks)*wait_ticks=(uint64_t)InterlockedCompareExchange64(&s_trap_wait,0,0);
+}
 int nv2a_trap_dispatch(volatile void *registers, uint32_t parameter,
                        Nv2aRequestInterrupt request, void *context)
 {
+    LARGE_INTEGER wait_start,wait_end;
     ULONGLONG report=GetTickCount64()+2000;
     static unsigned handled;
     int complete=0;
@@ -78,6 +85,7 @@ int nv2a_trap_dispatch(volatile void *registers, uint32_t parameter,
     set_source(registers,1);
     nv2a_trap_handler_unlock();
     request(context);
+    QueryPerformanceCounter(&wait_start);
     while((hooked ? InterlockedCompareExchange(&s_completed,0,0)!=ticket
                   : REG(0x400720)==2) && !nv2a_ack_stopping()) {
         ULONGLONG now=GetTickCount64();
@@ -91,6 +99,9 @@ int nv2a_trap_dispatch(volatile void *registers, uint32_t parameter,
         if(hooked && s_taken_event)WaitForSingleObject(s_taken_event,1);
         else Sleep(0);
     }
+    QueryPerformanceCounter(&wait_end);
+    InterlockedAdd64(&s_trap_wait,wait_end.QuadPart-wait_start.QuadPart);
+    InterlockedIncrement64(&s_trap_count);
     /* Older projects can still use the FIFO sentinel. Hooked projects use
      * the original handler's explicit completion instead. */
     if(hooked)complete=InterlockedCompareExchange(&s_completed,0,0)==ticket;

@@ -10,13 +10,6 @@
 
 static HANDLE s_thread;
 static volatile LONG s_stop;
-#ifdef _WIN32
-/* Experimental bounded idle polling. Zero preserves the established loop;
- * a high-resolution timer avoids turning a short delay into Sleep(1)'s tick.
- * The MMIO masks, publication locks and acknowledgment operation are identical. */
-static volatile uint32_t s_poll_us;
-static volatile LONG s_poll_timer_ready;
-#endif
 static SRWLOCK s_irq_lock=SRWLOCK_INIT;
 static unsigned s_pgraph_holds;
 static int s_vblank_hooked, s_vblank_pending;
@@ -41,10 +34,35 @@ static const struct { uint32_t offset, clear, set; } flags[] = {
     { 0x003214, 0, 0x00000010u }, /* PFIFO_CACHE1_STATUS LOW_MARK */
 };
 
+/* NV_PGRAPH_INCREMENT is a write-only trigger on hardware: READ_3D (bit 1)
+ * advances the flip read index, which FLIP_STALL waits on. XDK D3D's vblank
+ * handler writes it when a queued flip may be shown, so it is what paces a
+ * title to its presentation interval. Here the register is plain memory, so
+ * it is taken and cleared atomically and each write counted. Both this
+ * worker and the command worker poll it continuously. */
+static volatile LONG s_flip_increments, s_flip_pacing=-1;
+int nv2a_ack_flip_pacing(void)
+{
+    if(s_flip_pacing<0) {
+        const char *e=getenv("RECOMP_FLIP_PACING");
+        InterlockedCompareExchange(&s_flip_pacing,e && *e=='1',-1);
+    }
+    return s_flip_pacing!=0;
+}
+uint32_t nv2a_ack_take_flip_increments(void)
+{
+    return (uint32_t)InterlockedExchange(&s_flip_increments,0);
+}
+static volatile LONG s_ack_activity;
 void nv2a_ack_tick(volatile void *registers)
 {
     size_t i;
     if (!registers) return;
+    if (nv2a_ack_flip_pacing()) {
+        volatile LONG *inc=(volatile LONG *)((volatile uint8_t *)registers+0x40071C);
+        if (*inc && (InterlockedExchange(inc,0) & 2))
+            InterlockedIncrement(&s_flip_increments);
+    }
     for (i=0; i<sizeof(flags)/sizeof(flags[0]); i++) {
         volatile LONG *r=(volatile LONG *)((volatile uint8_t *)registers+flags[i].offset);
         /* Aligned MMIO words use the same volatile loads as the title. Avoid
@@ -66,7 +84,7 @@ void nv2a_ack_tick(volatile void *registers)
             /* Full barrier before acknowledging the write-combine flush;
              * preserve unrelated bits if the title writes concurrently. */
             observed=InterlockedCompareExchange(r,value,old);
-            if (observed==old) break;
+            if (observed==old) { InterlockedIncrement(&s_ack_activity); break; }
             old=observed;
         }
         if(irq)ReleaseSRWLockShared(&s_irq_lock);
@@ -123,62 +141,43 @@ void nv2a_ack_hold_pgraph(int hold)
 void nv2a_ack_request_stop(void) { InterlockedExchange(&s_stop,1); }
 int nv2a_ack_stopping(void) { return InterlockedCompareExchange(&s_stop,0,0)!=0; }
 
+/* The flag worker used to spin on Sleep(0) for the whole session, a full
+ * core even with nothing to acknowledge -- on a loaded host that core was
+ * taken from the command worker and the guest. Spin while flags are being
+ * raised (the title busy-waits on these handshakes), and after ~2,000 idle
+ * polls wait 250 us on a high-resolution timer between polls instead.
+ * RECOMP_ACK_BACKOFF=0 keeps the original spin. */
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 static DWORD WINAPI flag_thread(LPVOID registers)
 {
-#ifdef _WIN32
-    HANDLE timer=NULL;
-    int attempted=0;
-    LARGE_INTEGER frequency={0};
-    uint64_t active_until=0;
-#endif
+    const char *e=getenv("RECOMP_ACK_BACKOFF");
+    HANDLE timer=(e && *e=='0')?NULL:CreateWaitableTimerExW(NULL,NULL,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
+    unsigned idle=0;
     while (!InterlockedCompareExchange(&s_stop,0,0)) {
-#ifdef _WIN32
-        uint32_t us=s_poll_us;
-        int requested=us && (*(volatile uint32_t *)((volatile uint8_t *)registers+0x100410)&0x10000);
-#endif
+        LONG before=s_ack_activity;
         nv2a_ack_tick(registers);
-#ifdef _WIN32
-        {
-            if(us && us<=1000) {
-                LARGE_INTEGER due,now;
-                if(!attempted) {
-                    QueryPerformanceFrequency(&frequency);
-                    timer=CreateWaitableTimerExW(NULL,NULL,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                        TIMER_MODIFY_STATE|SYNCHRONIZE);
-                    attempted=1;
-                    InterlockedExchange(&s_poll_timer_ready,timer!=NULL);
-                }
-                QueryPerformanceCounter(&now);
-                /* Preserve fast consecutive write-combine handshakes. The
-                 * idle timer applies only after two milliseconds without a
-                 * request, not between every acknowledgment in a burst. */
-                if(requested)active_until=(uint64_t)now.QuadPart+(uint64_t)frequency.QuadPart/500;
-                if((uint64_t)now.QuadPart<active_until) { Sleep(0);continue; }
-                due.QuadPart=-(LONGLONG)us*10;
-                if(timer && SetWaitableTimer(timer,&due,0,NULL,NULL,FALSE)
-                    && WaitForSingleObject(timer,10)==WAIT_OBJECT_0)continue;
-            }
+        idle=s_ack_activity!=before?0:idle+1;
+        if (!timer || idle<2000) {
+            Sleep(0);
+        } else {
+            LARGE_INTEGER due;
+            due.QuadPart=-2500;                 /* 250 us, relative */
+            if (SetWaitableTimer(timer,&due,0,NULL,NULL,FALSE))
+                WaitForSingleObject(timer,INFINITE);
+            else
+                Sleep(0);
         }
-#endif
-        Sleep(0);
     }
-#ifdef _WIN32
-    if(timer)CloseHandle(timer);
-    InterlockedExchange(&s_poll_timer_ready,0);
-#endif
+    if (timer) CloseHandle(timer);
     return 0;
 }
 
 int nv2a_ack_start(volatile void *registers)
 {
     if (!registers || s_thread) return 0;
-#ifdef _WIN32
-    {
-        const char *e=getenv("RECOMP_NV2A_ACK_POLL_US");char *end=NULL;
-        unsigned long us=e && *e?strtoul(e,&end,10):100;
-        s_poll_us=(end && *end) || us>1000?0:(uint32_t)us;
-    }
-#endif
     InterlockedExchange(&s_stop,0);
     s_thread=CreateThread(NULL,0,flag_thread,(LPVOID)registers,0,NULL);
     return s_thread!=NULL;

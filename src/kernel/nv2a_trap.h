@@ -13,4 +13,7 @@ void nv2a_trap_enable_handler_hook(void);
 void nv2a_trap_handler_lock(void);
 void nv2a_trap_handler_taken(volatile void *registers);
 void nv2a_trap_handler_unlock(void);
+/* Cumulative traps and QueryPerformanceCounter ticks spent waiting for the
+ * guest handler (diagnostics). */
+void nv2a_trap_stats(uint64_t *count, uint64_t *wait_ticks);
 #endif

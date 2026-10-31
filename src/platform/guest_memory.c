@@ -298,3 +298,10 @@ void xbox_MemoryEndGpu(void)
 }
 int xbox_MemoryGpuOwned(void) { return s_gpu_owned; }
 int xbox_MemoryGpuYieldAllowed(void) { return gpu_yield_enabled() && s_read_depth==1 && !s_gpu_owned; }
+static xbox_HostAccessFn volatile s_host_access;
+void xbox_MemorySetHostAccessHook(xbox_HostAccessFn fn) { s_host_access=fn; }
+void xbox_MemoryHostAccess(void *p,size_t bytes,int write)
+{
+    xbox_HostAccessFn fn=s_host_access;
+    if(fn && p && bytes)fn(p,bytes,write);
+}

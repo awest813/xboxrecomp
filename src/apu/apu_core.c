@@ -83,8 +83,22 @@ void mcpx_debug_begin_frame(void) {}
 void mcpx_debug_end_frame(void) {}
 
 /* ============================================================
- * IRQ handling (stubbed - no PCI bus in standalone)
+ * IRQ handling: the APU's line goes to the kernel, which calls the title's
+ * connected ISR (DirectSound's, vector 0x35) from its timer thread.
+ *
+ * It used to go nowhere (the qemu_shim stub), so DirectSound's ISR never
+ * ran: packet completions, position notifications, voice-end and idle-voice
+ * traps were only noticed when some other path happened to look. MVP 06
+ * connects that ISR (KeConnectInterrupt vector 53) and its between-pitch
+ * flow waited 25-70 s, or forever. NFSU2's port fixed the same silence the
+ * same way. RECOMP_APU_IRQ=0 restores the old behaviour.
  * ============================================================ */
+
+extern void xbox_ApuInterruptLine(int level);
+#undef pci_irq_assert
+#undef pci_irq_deassert
+#define pci_irq_assert(dev)   xbox_ApuInterruptLine(1)
+#define pci_irq_deassert(dev) xbox_ApuInterruptLine(0)
 
 static void update_irq(MCPXAPUState *d)
 {
@@ -511,6 +525,13 @@ static void se_frame(MCPXAPUState *d)
     mcpx_apu_vp_frame(d, mixbins);
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
+
+    /* A notifier write or idle-voice trap latched this frame: raise it now,
+     * or the trap halts the front end unseen. */
+    if (d->set_irq) {
+        d->set_irq = false;
+        update_irq(d);
+    }
 
     /* A movie can wait on DirectSound's playback cursor after decoding its
      * first frame. Trace voice progress at a bounded rate to distinguish

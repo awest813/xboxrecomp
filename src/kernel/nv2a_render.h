@@ -16,15 +16,24 @@ typedef struct {
     const void *source, *palette;
     size_t source_bytes, palette_bytes;
     uint32_t width, height, pitch, format, normalized, addr_u, addr_v;
+    /* NV097_SET_TEXTURE_FILTER and _BORDER_COLOR, as the stage holds them. */
+    uint32_t filter, border;
     int valid;
     /* Decode the base level using the executor's existing format decoder. */
     int (*decode)(void *opaque, uint32_t *argb);
     void *opaque;
+    /* Mip levels stored after the base (1 = base only); source_bytes spans
+     * all of them. decode_level decodes level >= 1 at max(1, size >> level). */
+    uint32_t levels;
+    int (*decode_level)(void *opaque, uint32_t level, uint32_t *argb);
 } Nv2aRenderTexture;
 
 typedef struct {
     uint8_t *color, *depth;
     uint32_t pitch, height, color_bpp, depth_pitch, depth_bpp;
+    /* SET_SURFACE_FORMAT colour code and layout. A swizzled surface's pitch
+     * is its width in bytes; its texels are Morton-ordered in RAM. */
+    uint32_t color_format, swizzled;
     uint32_t clip_x, clip_y, clip_w, clip_h;
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t blend_enable, blend_src, blend_dst, blend_equation, blend_color;
@@ -49,6 +58,21 @@ typedef struct {
  * an explicit scope, 1 means queued; flush/end must succeed before RAM access.
  * A rejected draw does not modify RAM for that draw. */
 int nv2a_render_draw(const Nv2aRenderBatch *batch);
+/* NV097_CLEAR_SURFACE. flags is the method parameter (Z=1, stencil=2,
+ * color 0xF0). Rects are [x0,y0,x1,y1). Returns 1 when the resident GPU
+ * surfaces performed the clear (guest RAM catches up on demand), 0 when the
+ * caller must clear RAM itself. */
+typedef struct {
+    uint8_t *color, *depth;
+    uint32_t pitch, height, depth_pitch, depth_bpp;
+    uint32_t rect[4], depth_rect[4];
+    uint32_t flags, color_value, zstencil;
+} Nv2aRenderClear;
+int nv2a_render_clear(const Nv2aRenderClear *clear);
+/* Fill `out` (pitch*height bytes, the surface's own layout) with a display
+ * copy of a finished resident surface, from the previous flip's GPU copy.
+ * Returns 0 when the caller must read the surface from RAM instead. */
+int nv2a_render_present(const uint8_t *color, uint32_t pitch, uint32_t height, uint8_t *out);
 /* Single-consumer transaction: the caller excludes CPU/other-device access to
  * target memory until end. Flush before software draws, clears, fences, flips
  * or any other RAM observer. Target changes and texture/palette aliases flush
@@ -75,6 +99,11 @@ void nv2a_render_observer_stats(Nv2aRenderObserver observer,
                                 uint64_t *calls, uint64_t *resolves, uint64_t *bytes);
 void nv2a_render_memory_read(const void *source, size_t bytes);
 int nv2a_render_enabled(void);
+/* Residency (RECOMP_GPU_RESIDENT=1) page-protects surfaces in the guest's
+ * contiguous window and its tiled alias; the memory layout describes both.
+ * Host-kernel I/O on guest buffers must call nv2a_render_host_access first. */
+void nv2a_render_set_window(void *contig, void *tiled, size_t tiled_bytes);
+void nv2a_render_host_access(void *p, size_t bytes, int write);
 void nv2a_render_shutdown(void);
 void nv2a_render_stats(uint64_t *draws, uint64_t *fallbacks);
 typedef struct {

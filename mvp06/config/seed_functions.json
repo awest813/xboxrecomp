@@ -130,5 +130,13 @@
  {
   "start": "0x0013D210",
   "note": "Indirect destructor thunk reached six times when run109 exits the idle stadium demo. Independent 11-byte body at the previous function's exclusive end: store vtable 0x0061960C through ECX, then tail-jump to already translated 0x0013B640; INT3 padding starts at 0x0013D21B."
+ },
+ {
+  "start": "0x0005E440",
+  "note": "Runtime state-machine method table (0x6C3AF8, filled at runtime); dispatch miss when a runner reaches base froze pitching. 16-byte thiscall: test [ecx+0x126], tail-jumps 0x5DBE0."
+ },
+ {
+  "start": "0x00056B60",
+  "note": "Same runtime method table: this-adjusting thunk (mov ecx,[ecx+0x118]; jmp 0x4A4D0)."
  }
 ]

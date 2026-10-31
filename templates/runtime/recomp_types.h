@@ -289,6 +289,18 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
     return (int64_t)rounded;
 }
+/* frndint rounds st0 to an integer in the guest's RC mode too. It was host
+ * rint(), always round-to-nearest, but the CRT's floor() and ceil() are
+ * "set RC down/up, frndint, restore": MVP 06's floor (0x442BCC) loads control
+ * word 0x173F and ceil (0x443FFE) 0x1B3F, so floor(2.7) came out 3. */
+static inline double recomp_frndint(double value, uint16_t control) {
+    switch((control>>10)&3) {
+    case 1: return floor(value);
+    case 2: return ceil(value);
+    case 3: return trunc(value);
+    default: return nearbyint(value);   /* host default: nearest-even */
+    }
+}
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)

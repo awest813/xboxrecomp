@@ -615,6 +615,31 @@ int main(int argc,char **argv)
         pixel=0xAABBCCDD;b.alpha_test=1;b.alpha_func=0x201;b.alpha_ref=0;
         assert(nv2a_render_draw(&b));assert(pixel==0xAABBCCDD);
     }
+    /* Dependent reads: an earlier stage's (A,R) or (G,B) addresses a lookup
+     * texture (MVP 06's depth-of-field focus table). Stage 0 holds the
+     * coordinates; the 2x2 table's quadrants tell which texel was read. */
+    {
+        static const uint32_t lut[4]={0xFF112233,0xFF445566,0xFF778899,0xFFAABBCC};
+        float expected[4];
+        unsigned dependent;
+        for(dependent=0;dependent<2;dependent++) {
+            unsigned stage=dependent?2:1;
+            Nv2aRenderTexture *t;
+            setup(&b,v,&pixel,texels);
+            t=&b.textures[stage];
+            t->source=lut;t->source_bytes=sizeof lut;t->width=t->height=2;t->pitch=8;
+            /* AR: A=0xC0,R=0x40 -> texel (1,0). GB via stage_input: G=0x40,B=0xC0 -> (0,1). */
+            texels[0]=dependent?0xFF0040C0u:0xC0400000u;
+            b.combiner.stage_program=1|(dependent?(NV2A_STAGE_DEPENDENT_GB<<10):(NV2A_STAGE_DEPENDENT_AR<<5));
+            b.combiner.stage_input=0;                 /* stage 2 reads stage 0 */
+            b.combiner.final0=8+stage;b.combiner.final1=(0x18+stage)<<8;
+            pixel=0xAABBCCDD;assert(nv2a_render_draw(&b));
+            nv2a_rc_unpack(lut[dependent?2:1],expected);
+            failures+=check_pixel(pixel,expected,100+dependent,0);
+        }
+    }
+    setup(&b,v,&pixel,texels);
+    b.combiner.final0=8;b.combiner.final1=0x1800;b.combiner.stage_program=1;
     /* Failed batches must leave guest RAM unchanged for software fallback. */
     pixel=0x13579BDF;b.color_bpp=2;assert(!nv2a_render_draw(&b));assert(pixel==0x13579BDF);
     coherent_regions();
